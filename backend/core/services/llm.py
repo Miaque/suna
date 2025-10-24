@@ -252,7 +252,14 @@ async def make_llm_api_call(
         #     f.write(f"Parameters:\n{json.dumps(params, indent=2, default=str)}\n")
         
         # logger.debug(f"LiteLLM parameters saved to: {filename}")
-        
+
+        # 如果config.OPENAI_COMPATIBLE_MODEL_NAME不为空，则使用config.OPENAI_COMPATIBLE_MODEL_NAME
+        if config.OPENAI_COMPATIBLE_MODEL_NAME:
+            params["model"] = config.OPENAI_COMPATIBLE_MODEL_NAME
+
+        if config.OPENAI_COMPATIBLE_API_BASE:
+            params["api_base"] = config.OPENAI_COMPATIBLE_API_BASE
+
         response = await provider_router.acompletion(**params)
         
         # For streaming responses, we need to handle errors that occur during iteration
@@ -289,11 +296,11 @@ if __name__ == "__main__":
     setup_api_keys()
 
     response = completion(
-        model="bedrock/anthropic.claude-sonnet-4-20250115-v1:0",
+        model=config.OPENAI_COMPATIBLE_MODEL_NAME,
         messages=[{"role": "user", "content": "Hello! Testing 1M context window."}],
         max_tokens=100,
-        extra_headers={
-            "anthropic-beta": "context-1m-2025-08-07"  # 👈 Enable 1M context
-        }
+        api_base=config.OPENAI_COMPATIBLE_API_BASE,
     )
+
+    print(response)
 

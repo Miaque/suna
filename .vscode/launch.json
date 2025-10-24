@@ -1,0 +1,57 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "dev",
+            "request": "launch",
+            "cwd": "${workspaceFolder}/frontend",
+            "runtimeArgs": [
+                "run",
+                "dev"
+            ],
+            "runtimeExecutable": "pnpm",
+            "skipFiles": [
+                "<node_internals>/**"
+            ],
+            "type": "node",
+            "envFile": "${workspaceFolder}/frontend/.env.local"
+        },
+        {
+            "name": "debugger",
+            "type": "debugpy",
+            "cwd": "${workspaceFolder}/backend",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "worker",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "dramatiq",
+            "cwd": "${workspaceFolder}/backend",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/backend/.env",
+            "args": [
+                "--skip-logging",
+                "--processes",
+                "4",
+                "--threads",
+                "4",
+                "run_agent_background"
+            ]
+        },
+        {
+            "name": "api",
+            "type": "debugpy",
+            "cwd": "${workspaceFolder}/backend",
+            "request": "launch",
+            "program": "api.py",
+            "console": "integratedTerminal",
+            "envFile": "${workspaceFolder}/backend/.env"
+        },
+    ]
+}

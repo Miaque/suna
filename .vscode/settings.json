@@ -1,4 +1,28 @@
 {
   "python.analysis.typeCheckingMode": "off",
-  "cursorpyright.analysis.typeCheckingMode": "off"
+  "cursorpyright.analysis.typeCheckingMode": "off",
+  "terminal.integrated.env.windows": {
+    "PYTHONPATH": "${workspaceFolder}/backend",
+  },
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/backend"
+  ],
+  "python.analysis.indexing": true,
+  "python.analysis.packageIndexDepths": [
+    {
+      "name": "",
+      "depth": 20,
+      "includeAllSymbols": true
+    }
+  ],
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.history": true,
+  },
+  "python.testing.pytestArgs": [
+    "-s"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
 }
