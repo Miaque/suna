@@ -15,7 +15,8 @@ import {
   User,
   CreditCard,
   Plug,
-  Palette,
+  Moon,
+  Sun,
   Globe,
   LogOut,
   ChevronRight,
@@ -23,6 +24,8 @@ import {
 } from 'lucide-react-native';
 import type { UserProfile } from './types';
 import { LanguageDrawer } from './LanguageDrawer';
+import { NameEditDrawer } from './NameEditDrawer';
+import { ThemeDrawer } from './ThemeDrawer';
 import * as Haptics from 'expo-haptics';
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
@@ -61,6 +64,8 @@ export function SettingsDrawer({ visible, profile, onClose }: SettingsDrawerProp
   const { t } = useLanguage();
   const router = useRouter();
   const [isLanguageDrawerVisible, setIsLanguageDrawerVisible] = React.useState(false);
+  const [isNameEditDrawerVisible, setIsNameEditDrawerVisible] = React.useState(false);
+  const [isThemeDrawerVisible, setIsThemeDrawerVisible] = React.useState(false);
   
   // Get user data
   const userName = user?.user_metadata?.full_name || user?.email?.split('@')[0] || profile?.name || 'Guest';
@@ -78,7 +83,7 @@ export function SettingsDrawer({ visible, profile, onClose }: SettingsDrawerProp
   const handleName = () => {
     console.log('🎯 Name/Profile management pressed');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    // TODO: Navigate to profile management
+    setIsNameEditDrawerVisible(true);
   };
   
   const handleBilling = () => {
@@ -91,13 +96,18 @@ export function SettingsDrawer({ visible, profile, onClose }: SettingsDrawerProp
   const handleIntegrations = () => {
     console.log('🎯 Integrations pressed');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    // TODO: Navigate to integrations
+    
+    Alert.alert(
+      t('settings.integrations') || 'Integrations',
+      'Integration management is coming soon! Connect your favorite apps to automate workflows.',
+      [{ text: t('common.ok') || 'OK' }]
+    );
   };
   
   const handleTheme = () => {
-    console.log('🎯 Theme & App Icon pressed');
+    console.log('🎯 Theme pressed');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    // TODO: Open theme selector
+    setIsThemeDrawerVisible(true);
   };
   
   const handleLanguage = () => {
@@ -204,8 +214,8 @@ export function SettingsDrawer({ visible, profile, onClose }: SettingsDrawerProp
             />
             
             <SettingsItem
-              icon={Palette}
-              label={t('settings.theme')}
+              icon={colorScheme === 'dark' ? Sun : Moon}
+              label={t('settings.themeTitle') || 'Theme'}
               onPress={handleTheme}
             />
             
@@ -239,6 +249,23 @@ export function SettingsDrawer({ visible, profile, onClose }: SettingsDrawerProp
       <LanguageDrawer 
         visible={isLanguageDrawerVisible} 
         onClose={() => setIsLanguageDrawerVisible(false)} 
+      />
+      
+      {/* Name Edit Drawer */}
+      <NameEditDrawer
+        visible={isNameEditDrawerVisible}
+        currentName={userName}
+        onClose={() => setIsNameEditDrawerVisible(false)}
+        onNameUpdated={(newName) => {
+          console.log('✅ Name updated to:', newName);
+          // User data will be refreshed by the drawer
+        }}
+      />
+      
+      {/* Theme Drawer */}
+      <ThemeDrawer
+        visible={isThemeDrawerVisible}
+        onClose={() => setIsThemeDrawerVisible(false)}
       />
     </View>
   );

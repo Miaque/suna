@@ -11,7 +11,7 @@ import Animated, {
 import { MessageRenderer, ToolCallPanel, ChatInput, type ToolMessagePair } from '@/components/chat';
 import { ThreadHeader, ThreadActionsDrawer } from '@/components/home';
 import { AgentDrawer } from '@/components/agents';
-import { AttachmentDrawer } from '@/components/attachments';
+import { AttachmentDrawer, AttachmentBar } from '@/components/attachments';
 import { useAgentManager, useAudioRecorder, useAudioRecordingHandlers, type UseChatReturn } from '@/hooks';
 import { Text } from '@/components/ui/text';
 import { MessageCircle, ArrowDown } from 'lucide-react-native';
@@ -46,7 +46,11 @@ export function ThreadPage({
   // Custom hooks - Clean separation of concerns
   const agentManager = useAgentManager();
   const audioRecorder = useAudioRecorder();
-  const audioHandlers = useAudioRecordingHandlers(audioRecorder, agentManager);
+  const audioHandlers = useAudioRecordingHandlers(
+    audioRecorder, 
+    agentManager, 
+    chat.transcribeAndAddToInput
+  );
   const { colorScheme } = useColorScheme();
   const insets = useSafeAreaInsets();
   const [isThreadActionsVisible, setIsThreadActionsVisible] = React.useState(false);
@@ -251,6 +255,12 @@ export function ThreadPage({
           pointerEvents="none"
         />
         
+        {/* Attachment Bar - Above Input */}
+        <AttachmentBar 
+          attachments={chat.attachments}
+          onRemove={chat.removeAttachment}
+        />
+        
         {/* Chat Input */}
         <Pressable 
           onPress={Keyboard.dismiss}
@@ -279,6 +289,7 @@ export function ThreadPage({
             onOpenAuthDrawer={onOpenAuthDrawer}
             isAgentRunning={chat.isAgentRunning}
             isSendingMessage={chat.isSendingMessage}
+            isTranscribing={chat.isTranscribing}
           />
         </Pressable>
       </Animated.View>

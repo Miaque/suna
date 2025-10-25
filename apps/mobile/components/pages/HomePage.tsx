@@ -8,7 +8,7 @@ import Animated, {
   useAnimatedKeyboard,
 } from 'react-native-reanimated';
 import { AgentDrawer } from '@/components/agents';
-import { AttachmentDrawer } from '@/components/attachments';
+import { AttachmentDrawer, AttachmentBar } from '@/components/attachments';
 import { ChatInput, type ChatInputRef } from '@/components/chat';
 import { QuickActionBar } from '@/components/quick-actions';
 import { BackgroundLogo, TopNav } from '@/components/home';
@@ -49,7 +49,11 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
   // Custom hooks - Clean separation of concerns
   const agentManager = useAgentManager();
   const audioRecorder = useAudioRecorder();
-  const audioHandlers = useAudioRecordingHandlers(audioRecorder, agentManager);
+  const audioHandlers = useAudioRecordingHandlers(
+    audioRecorder, 
+    agentManager, 
+    chat.transcribeAndAddToInput
+  );
   const { colorScheme } = useColorScheme();
   
   // ChatInput ref for programmatic focus
@@ -82,7 +86,7 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
   });
 
   return (
-    <View className="flex-1 bg-background" style={{ overflow: 'hidden' }}>
+    <View className="flex-1 bg-background">
       <KeyboardAvoidingView 
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         className="flex-1"
@@ -135,6 +139,12 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
                 onSelectOption={() => {}}
               />
               
+              {/* Attachment Bar - Above Input */}
+              <AttachmentBar 
+                attachments={chat.attachments}
+                onRemove={chat.removeAttachment}
+              />
+              
               {/* Chat Input */}
               <View className="mx-3 mb-8">
                 <ChatInput
@@ -160,6 +170,7 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
                   onOpenAuthDrawer={onOpenAuthDrawer}
                   isAgentRunning={chat.isAgentRunning}
                   isSendingMessage={chat.isSendingMessage}
+                  isTranscribing={chat.isTranscribing}
                 />
               </View>
             </Animated.View>
