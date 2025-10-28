@@ -51,7 +51,7 @@ export const metadata: Metadata = {
   publisher:
     'Kortix Team',
   category: 'Technology',
-  applicationName: 'Suna',
+  applicationName: 'Kortix',
   formatDetection: {
     telephone: false,
     email: false,
@@ -66,38 +66,31 @@ export const metadata: Metadata = {
     },
   },
   openGraph: {
-    title: 'Suna - Open Source Generalist AI Worker',
-    description:
-      'Suna is a fully open source AI assistant that helps you accomplish real-world tasks with ease through natural conversation.',
+    type: 'website',
     url: siteConfig.url,
-    siteName: 'Suna',
+    siteName: 'Kortix',
+    title: 'Kortix - Open Source Generalist AI Worker',
+    description:
+      'Kortix is a fully open source AI assistant that helps you accomplish real-world tasks with ease through natural conversation.',
     images: [
       {
-        url: '/banner.png',
+        url: new URL('/banner.png', siteConfig.url).toString(),
         width: 1200,
         height: 630,
-        alt: 'Suna - Open Source Generalist AI Worker',
+        alt: 'Kortix - Open Source Generalist AI Worker',
         type: 'image/png',
       },
     ],
     locale: 'en_US',
-    type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Suna - Open Source Generalist AI Worker',
-    description:
-      'Suna is a fully open source AI assistant that helps you accomplish real-world tasks with ease through natural conversation.',
-    creator: '@kortixai',
     site: '@kortixai',
-    images: [
-      {
-        url: '/banner.png',
-        width: 1200,
-        height: 630,
-        alt: 'Suna - Open Source Generalist AI Worker',
-      },
-    ],
+    creator: '@kortixai',
+    title: 'Kortix - Open Source Generalist AI Worker',
+    description:
+      'Kortix is a fully open source AI assistant that helps you accomplish real-world tasks with ease through natural conversation.',
+    images: [new URL('/banner.png', siteConfig.url).toString()],
   },
   icons: {
     icon: [{ url: '/favicon.png', sizes: 'any' }],

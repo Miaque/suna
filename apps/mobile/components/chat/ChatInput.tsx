@@ -39,6 +39,8 @@ interface ChatInputProps extends ViewProps {
   agent?: Agent;
   isRecording?: boolean;
   recordingDuration?: number;
+  audioLevel?: number;
+  audioLevels?: number[]; // Time-series buffer for waveform
   attachments?: Attachment[];
   onRemoveAttachment?: (index: number) => void;
   selectedQuickAction?: string | null;
@@ -79,6 +81,8 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
   agent,
   isRecording = false,
   recordingDuration = 0,
+  audioLevel = 0,
+  audioLevels = [],
   attachments = [],
   onRemoveAttachment,
   selectedQuickAction,
@@ -135,6 +139,17 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
       rotation.value = withTiming(0, { duration: 0 });
     }
   }, [isSendingMessage]);
+
+  // Rotating animation for transcription state
+  React.useEffect(() => {
+    if (isTranscribing) {
+      rotation.value = withRepeat(
+        withTiming(360, { duration: 1000 }),
+        -1,
+        false
+      );
+    }
+  }, [isTranscribing]);
   
   // States
   const { colorScheme } = useColorScheme();
@@ -177,7 +192,7 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
   
   // Calculate dynamic height based on content
   const dynamicHeight = React.useMemo(() => {
-    const baseHeight = 140;
+    const baseHeight = 150;
     const maxHeight = 280;
     // No longer need attachment height as they're external
     const calculatedHeight = contentHeight + 80; // Add padding for controls
@@ -262,9 +277,10 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
 
   const handleButtonPress = () => {
     if (isAgentRunning) {
-      // Stop agent run
+      // Stop agent run immediately
       console.log('🛑 Stop agent run pressed');
       onStopAgentRun?.();
+      return; // Early return to prevent any other actions
     } else if (isRecording) {
       // Send audio recording
       handleSendAudioMessage();
@@ -326,7 +342,7 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
           <>
             {/* Waveform */}
             <View className="flex-1 items-center bottom-5 justify-center">
-              <AudioWaveform isRecording={true} barCount={42} />
+              <AudioWaveform isRecording={true} audioLevels={audioLevels} />
             </View>
             
             {/* Timer / Transcription Status */}
@@ -348,7 +364,7 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                 }}
                 onPress={onCancelRecording}
                 className="bg-secondary rounded-full items-center justify-center"
-                style={[{ width: 33.75, height: 33.75 }, cancelAnimatedStyle]}
+                style={[{ width: 40, height: 40 }, cancelAnimatedStyle]}
               >
                 <Icon 
                   as={X} 
@@ -368,11 +384,11 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                 }}
                 onPress={handleSendAudioMessage}
                 className="bg-primary rounded-full items-center justify-center"
-                style={[{ width: 33.75, height: 33.75 }, stopAnimatedStyle]}
+                style={[{ width: 40, height: 40 }, stopAnimatedStyle]}
               >
                 <Icon 
                   as={CornerDownLeft} 
-                  size={15} 
+                  size={16} 
                   className="text-primary-foreground"
                   strokeWidth={2}
                 />
@@ -435,7 +451,7 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                   }}
                   onPress={onAttachPress}
                   disabled={isSendingMessage || isAgentRunning || isTranscribing}
-                  className="bg-primary/5 rounded-full w-9 h-9 items-center justify-center border border-border/30"
+                  className="bg-primary/5 rounded-full w-10 h-10 items-center justify-center border border-border/30"
                   style={[
                     attachAnimatedStyle,
                     { opacity: isSendingMessage || isAgentRunning || isTranscribing ? 0.4 : 1 }
@@ -443,7 +459,7 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                 >
                   <Icon 
                     as={Paperclip} 
-                    size={15} 
+                    size={16} 
                     className="text-foreground"
                   />
                 </AnimatedPressable>
@@ -455,12 +471,12 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                       console.log('❌ Clearing quick action context');
                       onClearQuickAction?.();
                     }}
-                    className="bg-primary/10 rounded-full flex-row items-center h-9 px-2 border border-primary/20 active:opacity-70"
+                    className="bg-primary/10 rounded-full flex-row items-center h-10 px-3 border border-primary/20 active:opacity-70"
                   >
                     <Icon 
                       as={QuickActionIcon} 
-                      size={15} 
-                      className="text-primary mr-1"
+                      size={16} 
+                      className="text-primary mr-1.5"
                       strokeWidth={2}
                     />
                     <Icon 
@@ -487,19 +503,19 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                     sendScale.value = withSpring(1, { damping: 15, stiffness: 400 });
                   }}
                   onPress={handleButtonPress}
-                  disabled={isSendingMessage}
+                  disabled={isSendingMessage || isTranscribing}
                   className={`rounded-full items-center justify-center ${
                     isAgentRunning 
                       ? 'bg-destructive' 
                       : 'bg-primary'
                   }`}
-                  style={[{ width: 33.75, height: 33.75 }, sendAnimatedStyle]}
+                  style={[{ width: 40, height: 40 }, sendAnimatedStyle]}
                 >
-                  {isSendingMessage ? (
+                  {isSendingMessage || isTranscribing ? (
                     <AnimatedView style={rotationAnimatedStyle}>
                       <Icon 
                         as={Loader2}
-                        size={15} 
+                        size={16} 
                         className="text-primary-foreground"
                         strokeWidth={2}
                       />
@@ -513,7 +529,7 @@ export const ChatInput = React.forwardRef<ChatInputRef, ChatInputProps>(({
                             ? CornerDownLeft 
                             : AudioLines
                       } 
-                      size={isAgentRunning ? 12 : 15} 
+                      size={isAgentRunning ? 14 : 16} 
                       className="text-primary-foreground"
                       strokeWidth={2}
                     />

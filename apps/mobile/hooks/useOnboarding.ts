@@ -14,8 +14,8 @@ const ONBOARDING_KEY_PREFIX = '@onboarding_completed_';
  * const { hasCompletedOnboarding, isLoading, markAsCompleted } = useOnboarding();
  */
 export function useOnboarding() {
-  const { session } = useAuthContext();
-  const [hasCompletedOnboarding, setHasCompletedOnboarding] = useState<boolean | null>(null);
+  const { session, isLoading: authLoading } = useAuthContext();
+  const [hasCompletedOnboarding, setHasCompletedOnboarding] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState(true);
 
   // Generate user-specific key
@@ -24,12 +24,7 @@ export function useOnboarding() {
     return `${ONBOARDING_KEY_PREFIX}${userId}`;
   }, [session?.user?.id]);
 
-  // Check onboarding status on mount and when user changes
-  useEffect(() => {
-    checkOnboardingStatus();
-  }, [session?.user?.id]);
-
-  const checkOnboardingStatus = async () => {
+  const checkOnboardingStatus = useCallback(async () => {
     try {
       const key = getOnboardingKey();
       const completed = await AsyncStorage.getItem(key);
@@ -41,7 +36,17 @@ export function useOnboarding() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [getOnboardingKey]);
+
+  // Check onboarding status ONLY after auth is loaded and when user changes
+  useEffect(() => {
+    // Wait for auth to complete first
+    if (authLoading) {
+      return;
+    }
+    
+    checkOnboardingStatus();
+  }, [checkOnboardingStatus, authLoading]);
 
   const markAsCompleted = useCallback(async () => {
     try {

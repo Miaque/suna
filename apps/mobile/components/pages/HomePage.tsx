@@ -54,6 +54,9 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
     agentManager, 
     chat.transcribeAndAddToInput
   );
+  
+  // Combined transcription state (from either chat or audio handlers)
+  const isTranscribing = chat.isTranscribing || audioHandlers.isTranscribing;
   const { colorScheme } = useColorScheme();
   
   // ChatInput ref for programmatic focus
@@ -162,6 +165,8 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
                   agent={agentManager.selectedAgent || undefined}
                   isRecording={audioRecorder.isRecording}
                   recordingDuration={audioRecorder.recordingDuration}
+                  audioLevel={audioRecorder.audioLevel}
+                  audioLevels={audioRecorder.audioLevels}
                   attachments={chat.attachments}
                   onRemoveAttachment={chat.removeAttachment}
                   selectedQuickAction={chat.selectedQuickAction}
@@ -170,7 +175,7 @@ export const HomePage = React.forwardRef<HomePageRef, HomePageProps>(({
                   onOpenAuthDrawer={onOpenAuthDrawer}
                   isAgentRunning={chat.isAgentRunning}
                   isSendingMessage={chat.isSendingMessage}
-                  isTranscribing={chat.isTranscribing}
+                  isTranscribing={isTranscribing}
                 />
               </View>
             </Animated.View>

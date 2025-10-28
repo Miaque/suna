@@ -2,10 +2,11 @@
  * Audio Transcription API
  * 
  * Handles audio file transcription using backend Whisper API
+ * Uses expo-file-system legacy API for reliable async operations
  */
 
 import { API_URL, getAuthToken } from '@/api/config';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 
 export interface TranscriptionResult {
   text: string;
@@ -17,9 +18,102 @@ export interface TranscriptionError {
 }
 
 /**
+ * Save audio recording to permanent file in the file system
+ * 
+ * Reads the audio file from expo-audio's temporary location and saves it
+ * to a permanent location in the cache directory.
+ * 
+ * @param temporaryUri - URI of the temporary audio file from expo-audio
+ * @returns URI of the saved file in cache directory
+ */
+/**
+ * Wait for file to exist by polling
+ */
+async function waitForFileToExist(uri: string, maxRetries: number = 10, initialDelay: number = 200): Promise<boolean> {
+  for (let i = 0; i < maxRetries; i++) {
+    const delay = initialDelay + (i * 100); // Exponential backoff
+    console.log(`🔍 Retry ${i + 1}/${maxRetries}: Waiting ${delay}ms before checking file...`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    try {
+      const fileInfo = await FileSystem.getInfoAsync(uri);
+      if (fileInfo.exists) {
+        console.log(`✅ File exists after retry ${i + 1}!`);
+        return true;
+      }
+      console.log(`⚠️ File still doesn't exist (attempt ${i + 1}/${maxRetries})`);
+    } catch (error) {
+      console.log(`⚠️ Error checking file (attempt ${i + 1}/${maxRetries}):`, error);
+    }
+  }
+  return false;
+}
+
+export async function saveAudioToFileSystem(temporaryUri: string): Promise<string> {
+  console.log('💾 Saving audio to file system:', temporaryUri);
+  
+  // Validate the URI
+  if (!temporaryUri || temporaryUri.trim() === '') {
+    throw new Error('Invalid audio URI: URI is empty or undefined');
+  }
+  
+  // Wait for file to exist with retries
+  console.log('⏳ Waiting for audio file to be written to disk...');
+  const fileExists = await waitForFileToExist(temporaryUri);
+  
+  if (!fileExists) {
+    console.error('❌ File never appeared on disk after all retries');
+    throw new Error(`Source audio file does not exist: ${temporaryUri}`);
+  }
+  
+  // Read the file
+  console.log('📖 Reading audio file...');
+  const base64Data = await FileSystem.readAsStringAsync(temporaryUri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  console.log('✅ Audio data read:', base64Data.length, 'chars');
+  
+  // Save to permanent location
+  const timestamp = Date.now();
+  const filename = `audio-recording-${timestamp}.m4a`;
+  const permanentPath = `${FileSystem.cacheDirectory}${filename}`;
+  
+  console.log('💾 Writing to permanent file:', permanentPath);
+  await FileSystem.writeAsStringAsync(permanentPath, base64Data, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  
+  // Verify the file was saved
+  const savedInfo = await FileSystem.getInfoAsync(permanentPath);
+  if (!savedInfo.exists) {
+    throw new Error(`Failed to save file. File does not exist: ${permanentPath}`);
+  }
+  
+  console.log('✅ Audio saved successfully to:', permanentPath);
+  
+  return permanentPath;
+}
+
+/**
+ * Delete cached audio file
+ * 
+ * @param uri - URI of the cached audio file to delete
+ */
+export async function deleteCachedAudio(uri: string): Promise<void> {
+  try {
+    console.log('🗑️ Deleting cached audio:', uri);
+    await FileSystem.deleteAsync(uri, { idempotent: true });
+    console.log('✅ Cached audio deleted');
+  } catch (error) {
+    console.warn('⚠️ Failed to delete cached audio:', error);
+    // Don't throw - cleanup failures shouldn't break the flow
+  }
+}
+
+/**
  * Transcribe audio file to text
  * 
- * @param audioUri - Local URI of the audio file
+ * @param audioUri - URI of the audio file
  * @param onProgress - Optional callback for upload progress (0-100)
  * @returns Transcribed text
  */
@@ -36,48 +130,38 @@ export async function transcribeAudio(
       throw new Error('Authentication required');
     }
 
-    // Extract filename from URI or use default
+    // Extract filename from URI
     const filename = audioUri.split('/').pop() || 'recording.m4a';
     
     // Determine MIME type based on file extension
-    let mimeType = 'audio/m4a';
+    // IMPORTANT: Use 'audio/mp4' for .m4a files as it's the standard MIME type
+    let mimeType = 'audio/mp4';
     if (filename.endsWith('.mp3')) {
-      mimeType = 'audio/mp3';
+      mimeType = 'audio/mpeg';
     } else if (filename.endsWith('.wav')) {
       mimeType = 'audio/wav';
     } else if (filename.endsWith('.webm')) {
       mimeType = 'audio/webm';
+    } else if (filename.endsWith('.mpga')) {
+      mimeType = 'audio/mpga';
     }
+    // Note: .m4a files should use 'audio/mp4' not 'audio/m4a'
     
     console.log('📤 Preparing audio file for upload...');
     console.log('📊 File:', filename, 'Type:', mimeType);
-    console.log('📊 File URI:', audioUri);
     
-    // CRITICAL: Read the file into base64 IMMEDIATELY
-    // React Native's FormData reads file URIs asynchronously during fetch,
-    // which means the file might be deleted before it's read.
-    // Solution: Read it into memory NOW as base64.
-    console.log('📖 Reading file into base64...');
-    const base64 = await FileSystem.readAsStringAsync(audioUri, {
-      encoding: 'base64',
-    });
-    console.log('✅ File read into memory:', base64.length, 'chars');
-    
-    // Convert base64 to Blob
-    const byteCharacters = atob(base64);
-    const byteNumbers = new Array(byteCharacters.length);
-    for (let i = 0; i < byteCharacters.length; i++) {
-      byteNumbers[i] = byteCharacters.charCodeAt(i);
-    }
-    const byteArray = new Uint8Array(byteNumbers);
-    const blob = new Blob([byteArray], { type: mimeType });
-    console.log('✅ Blob created:', blob.size, 'bytes');
-    
-    // Create FormData with the Blob (now safely in memory)
+    // In React Native, we send the file directly as a URI
+    // Create FormData with the file URI
     const formData = new FormData();
-    formData.append('audio_file', blob, filename);
     
-    console.log('✅ FormData created with audio blob');
+    // @ts-ignore - React Native's FormData supports { uri, type, name } format
+    formData.append('audio_file', {
+      uri: audioUri,
+      type: mimeType,
+      name: filename,
+    } as any);
+    
+    console.log('✅ FormData created with audio URI');
 
     console.log('📤 Uploading audio for transcription');
     console.log('📊 API URL:', `${API_URL}/transcription`);
@@ -173,7 +257,7 @@ export async function transcribeAudio(
 /**
  * Validate audio file before transcription
  * 
- * @param audioUri - Local URI of the audio file
+ * @param audioUri - URI of the audio file
  * @returns Validation result
  */
 export function validateAudioFile(audioUri: string): {
