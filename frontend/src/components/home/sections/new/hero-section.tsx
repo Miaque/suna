@@ -290,7 +290,7 @@ export function HeroSection() {
                                 <ChatInput
                                     ref={chatInputRef}
                                     onSubmit={handleChatInputSubmit}
-                                    placeholder="Describe the agent you want to build or the task you want completed..."
+                                    placeholder="Describe the task you want your Worker to complete..."
                                     loading={isSubmitting}
                                     disabled={isSubmitting}
                                     value={inputValue}
@@ -393,13 +393,13 @@ export function HeroSection() {
 
                     <div className="mt-8 text-center text-[13px] text-muted-foreground leading-relaxed">
                         By continuing, you agree to our{' '}
-                        <Link href="/terms" className="text-foreground/70 hover:text-foreground underline underline-offset-2 transition-colors">
+                        <a href="https://www.kortix.com/legal?tab=terms" target="_blank" rel="noopener noreferrer" className="text-foreground/70 hover:text-foreground underline underline-offset-2 transition-colors">
                             Terms of Service
-                        </Link>{' '}
+                        </a>{' '}
                         and{' '}
-                        <Link href="/privacy" className="text-foreground/70 hover:text-foreground underline underline-offset-2 transition-colors">
+                        <a href="https://www.kortix.com/legal?tab=privacy" target="_blank" rel="noopener noreferrer" className="text-foreground/70 hover:text-foreground underline underline-offset-2 transition-colors">
                             Privacy Policy
-                        </Link>
+                        </a>
                     </div>
                 </DialogContent>
             </Dialog>
