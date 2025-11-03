@@ -293,6 +293,25 @@ class ModelRegistry:
         #     priority=90,
         #     enabled=False  # Currently disabled
         # ))
+        # Qwen Models
+        self.register(
+            Model(
+                id="deepseek/glm-4.6",
+                name="GLM-4.6",
+                provider=ModelProvider.OPENAI,
+                aliases=["glm-4.6"],
+                context_window=200_000,
+                capabilities=[ModelCapability.CHAT, ModelCapability.FUNCTION_CALLING],
+                pricing=ModelPricing(
+                    input_cost_per_million_tokens=4.00,
+                    output_cost_per_million_tokens=16.00,
+                ),
+                tier_availability=["free", "paid"],
+                priority=90,
+                enabled=True,
+                config=ModelConfig(api_base=config.OPENAI_COMPATIBLE_API_BASE)
+            )
+        )
         
     
     def register(self, model: Model) -> None:
