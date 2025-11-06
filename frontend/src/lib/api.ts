@@ -310,39 +310,76 @@ export const getProject = async (projectId: string): Promise<Project> => {
     if (data.sandbox?.id) {
       // Fire off sandbox activation without blocking
       const ensureSandboxActive = async () => {
-        try {
-          const {
-            data: { session },
-          } = await supabase.auth.getSession();
+        const maxRetries = 5;
+        const baseDelay = 2000; // Start with 2 seconds
+        
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+          try {
+            const {
+              data: { session },
+            } = await supabase.auth.getSession();
 
-          // For public projects, we don't need authentication
-          const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-          };
+            // For public projects, we don't need authentication
+            const headers: Record<string, string> = {
+              'Content-Type': 'application/json',
+            };
 
-          if (session?.access_token) {
-            headers['Authorization'] = `Bearer ${session.access_token}`;
-          }
+            if (session?.access_token) {
+              headers['Authorization'] = `Bearer ${session.access_token}`;
+            }
 
-          const response = await fetch(
-            `${API_URL}/project/${projectId}/sandbox/ensure-active`,
-            {
-              method: 'POST',
-              headers,
-            },
-          );
-
-          if (!response.ok) {
-            const errorText = await response
-              .text()
-              .catch(() => 'No error details available');
-            console.warn(
-              `Failed to ensure sandbox is active: ${response.status} ${response.statusText}`,
-              errorText,
+            const response = await fetch(
+              `${API_URL}/project/${projectId}/sandbox/ensure-active`,
+              {
+                method: 'POST',
+                headers,
+              },
             );
+
+            if (!response.ok) {
+              const errorText = await response
+                .text()
+                .catch(() => 'No error details available');
+              
+              // Retry on any error if we have attempts left
+              if (attempt < maxRetries - 1) {
+                const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000); // Max 30s
+                console.log(`Sandbox ensure-active failed (${response.status}), retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+              }
+              
+              // Give up after all retries
+              console.warn(
+                `Failed to ensure sandbox is active after all retries: ${response.status} ${response.statusText}`,
+                errorText,
+              );
+              return;
+            }
+            
+             // Success! Parse response to get sandbox ID
+             try {
+               const result = await response.json();
+               const sandboxId = result.sandbox_id;
+               console.log('Sandbox is active:', sandboxId);
+               
+               // Dispatch event so components can invalidate caches
+               window.dispatchEvent(new CustomEvent('sandbox-active', {
+                 detail: { sandboxId, projectId }
+               }));
+             } catch (parseError) {
+               console.warn('Sandbox active but failed to parse response:', parseError);
+             }
+             return;
+          } catch (sandboxError) {
+            if (attempt < maxRetries - 1) {
+              const delay = Math.min(baseDelay * Math.pow(2, attempt), 30000);
+              console.log(`Error ensuring sandbox active, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              continue;
+            }
+            console.warn('Failed to ensure sandbox is active after all retries:', sandboxError);
           }
-        } catch (sandboxError) {
-          console.warn('Failed to ensure sandbox is active:', sandboxError);
         }
       };
 
@@ -534,6 +571,98 @@ export const getThreads = async (projectId?: string): Promise<Thread[]> => {
       resource: projectId ? `threads for project ${projectId}` : 'threads' 
     });
     return [];
+  }
+};
+
+// Paginated threads API - for components that need pagination
+export interface ThreadsResponse {
+  threads: Thread[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    pages: number;
+  };
+}
+
+export const getThreadsPaginated = async (projectId?: string, page: number = 1, limit: number = 50): Promise<ThreadsResponse> => {
+  try {
+    const params = new URLSearchParams({
+      page: page.toString(),
+      limit: limit.toString(),
+    });
+    
+    const response = await backendApi.get<{ threads: any[]; pagination: any }>(`/threads?${params.toString()}`, {
+      showErrors: false,
+    });
+
+    if (response.error) {
+      console.error('Error getting paginated threads:', response.error);
+      handleApiError(response.error, { 
+        operation: 'load threads', 
+        resource: projectId ? `threads for project ${projectId}` : 'threads' 
+      });
+      return {
+        threads: [],
+        pagination: {
+          page: 1,
+          limit: 50,
+          total: 0,
+          pages: 0,
+        }
+      };
+    }
+
+    if (!response.data?.threads) {
+      return {
+        threads: [],
+        pagination: response.data?.pagination || {
+          page: 1,
+          limit: 50,
+          total: 0,
+          pages: 0,
+        }
+      };
+    }
+
+    // Map backend response to Thread type
+    let threads = response.data.threads.map((thread: any) => ({
+      thread_id: thread.thread_id,
+      project_id: thread.project_id,
+      created_at: thread.created_at,
+      updated_at: thread.updated_at,
+      metadata: thread.metadata || {},
+    }));
+
+    // Filter by projectId if provided
+    if (projectId) {
+      threads = threads.filter((thread: Thread) => thread.project_id === projectId);
+    }
+
+    return {
+      threads,
+      pagination: response.data.pagination || {
+        page,
+        limit,
+        total: threads.length,
+        pages: 1,
+      }
+    };
+  } catch (err) {
+    console.error('Error fetching paginated threads:', err);
+    handleApiError(err, { 
+      operation: 'load threads', 
+      resource: projectId ? `threads for project ${projectId}` : 'threads' 
+    });
+    return {
+      threads: [],
+      pagination: {
+        page: 1,
+        limit: 50,
+        total: 0,
+        pages: 0,
+      }
+    };
   }
 };
 
