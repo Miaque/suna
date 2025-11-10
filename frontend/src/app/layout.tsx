@@ -2,7 +2,8 @@ import { ThemeProvider } from '@/components/home/theme-provider';
 import { siteConfig } from '@/lib/site';
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
-import { Providers } from './providers';
+import { AuthProvider } from '@/components/AuthProvider';
+import { ReactQueryProvider } from './react-query-provider';
 import { Toaster } from '@/components/ui/sonner';
 import { Analytics } from '@vercel/analytics/react';
 import { GoogleAnalytics } from '@next/third-parties/google';
@@ -12,6 +13,7 @@ import { PostHogIdentify } from '@/components/posthog-identify';
 import '@/lib/polyfills';
 import { roobert } from './fonts/roobert';
 import { roobertMono } from './fonts/roobert-mono';
+import { PlanSelectionModal } from '@/components/billing/pricing/plan-selection-modal';
 
 
 export const viewport: Viewport = {
@@ -199,10 +201,13 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <Providers>
-            {children}
-            <Toaster />
-          </Providers>
+          <AuthProvider>
+            <ReactQueryProvider>
+              {children}
+              <Toaster />
+              <PlanSelectionModal />
+            </ReactQueryProvider>
+          </AuthProvider>
           <Analytics />
           <GoogleAnalytics gaId="G-6ETJFB3PT3" />
           <SpeedInsights />
