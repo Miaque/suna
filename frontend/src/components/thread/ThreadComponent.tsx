@@ -80,8 +80,7 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
   const [filePathList, setFilePathList] = useState<string[] | undefined>(
     undefined,
   );
-  const debugMode = useState(false)[0];
-  const setDebugMode = useState(false)[1];
+  const [chatInputValue, setChatInputValue] = useState('');
   const [initialPanelOpenAttempted, setInitialPanelOpenAttempted] =
     useState(false);
   // Use Zustand store for agent selection persistence - skip in shared mode
@@ -519,6 +518,9 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
       if (!message.trim() || isShared || !addUserMessageMutation || !startAgentMutation) return;
       setIsSending(true);
 
+      // Clear the chat input value
+      setChatInputValue('');
+
       // Store the message to add optimistically when agent starts running
       pendingMessageRef.current = message;
 
@@ -604,6 +606,7 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
       setAgentRunId,
       isShared,
       selectedAgentId,
+      setChatInputValue,
     ],
   );
 
@@ -817,11 +820,6 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
     }
   }, [projectName]);
 
-  useEffect(() => {
-    const debugParam = searchParams.get('debug');
-    setDebugMode(debugParam === 'true');
-  }, [searchParams]);
-
   const hasCheckedUpgradeDialog = useRef(false);
 
   useEffect(() => {
@@ -856,33 +854,76 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
 
   // Scroll detection for show/hide scroll-to-bottom button
   useEffect(() => {
-    const handleScroll = () => {
-      if (!scrollContainerRef.current) return;
+    if (!initialLoadCompleted) return;
+
+    const checkScrollPosition = () => {
+      if (!scrollContainerRef.current) {
+        setShowScrollToBottom(false);
+        return;
+      }
 
       const scrollTop = scrollContainerRef.current.scrollTop;
       const scrollHeight = scrollContainerRef.current.scrollHeight;
       const clientHeight = scrollContainerRef.current.clientHeight;
-      const threshold = 100;
+      const threshold = 50;
 
-      // With flex-column-reverse, scrollTop becomes NEGATIVE when scrolling up
-      // Show button when scrollTop < -threshold (scrolled up enough from bottom)
-      const shouldShow = scrollTop < -threshold && scrollHeight > clientHeight;
+      // With flex-column-reverse, scrollTop can be NEGATIVE:
+      // - scrollTop = 0 or negative means we're at the "top" (visually the bottom/newest messages)
+      // - scrollTop becomes more negative as we scroll up (visually) from the bottom
+      // - scrollTop = -(scrollHeight - clientHeight) when fully scrolled up
+      // Show button when scrolled up enough from bottom (scrollTop is negative and less than -threshold)
+      const isScrolledUp = scrollTop < -threshold;
+      const hasScrollableContent = scrollHeight > clientHeight;
+      const shouldShow = isScrolledUp && hasScrollableContent;
+      
       setShowScrollToBottom(shouldShow);
     };
 
     const scrollContainer = scrollContainerRef.current;
-    if (scrollContainer) {
-      scrollContainer.addEventListener('scroll', handleScroll, {
-        passive: true,
-      });
-      // Check initial state
-      setTimeout(() => handleScroll(), 100);
-
-      return () => {
-        scrollContainer.removeEventListener('scroll', handleScroll);
-      };
+    if (!scrollContainer) {
+      setShowScrollToBottom(false);
+      return;
     }
+
+    // Attach scroll listener
+    scrollContainer.addEventListener('scroll', checkScrollPosition, {
+      passive: true,
+    });
+
+    // Also use ResizeObserver to check when content size changes
+    const resizeObserver = new ResizeObserver(() => {
+      checkScrollPosition();
+    });
+    resizeObserver.observe(scrollContainer);
+
+    // Check initial state with multiple timeouts to catch layout changes
+    const timeout1 = setTimeout(checkScrollPosition, 100);
+    const timeout2 = setTimeout(checkScrollPosition, 300);
+    const timeout3 = setTimeout(checkScrollPosition, 500);
+    const timeout4 = setTimeout(checkScrollPosition, 1000);
+
+    return () => {
+      scrollContainer.removeEventListener('scroll', checkScrollPosition);
+      resizeObserver.disconnect();
+      clearTimeout(timeout1);
+      clearTimeout(timeout2);
+      clearTimeout(timeout3);
+      clearTimeout(timeout4);
+    };
   }, [messages, initialLoadCompleted]);
+
+  // Auto-scroll to bottom on initial load
+  useEffect(() => {
+    if (initialLoadCompleted && scrollContainerRef.current && messages.length > 0) {
+      // Small delay to ensure DOM is fully rendered
+      const timeoutId = setTimeout(() => {
+        if (scrollContainerRef.current) {
+          scrollContainerRef.current.scrollTo({ top: 0, behavior: 'auto' });
+        }
+      }, 200);
+      return () => clearTimeout(timeoutId);
+    }
+  }, [initialLoadCompleted, messages.length]);
 
   if (!initialLoadCompleted || isLoading) {
     return <ThreadSkeleton isSidePanelOpen={isSidePanelOpen} compact={compact} />;
@@ -917,7 +958,6 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
         renderAssistantMessage={toolViewAssistant}
         renderToolResult={toolViewResult}
         isLoading={!initialLoadCompleted || isLoading}
-        debugMode={debugMode}
         isMobile={isMobile}
         initialLoadCompleted={initialLoadCompleted}
         agentName={agent && agent.name}
@@ -958,7 +998,6 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
           renderAssistantMessage={toolViewAssistant}
           renderToolResult={toolViewResult}
           isLoading={!initialLoadCompleted || isLoading}
-          debugMode={debugMode}
           isMobile={isMobile}
           initialLoadCompleted={initialLoadCompleted}
           agentName={agent && agent.name}
@@ -986,18 +1025,19 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
                 streamHookStatus={streamHookStatus}
                 sandboxId={sandboxId}
                 project={project}
-                debugMode={debugMode}
                 agentName={agent && agent.name}
                 agentAvatar={undefined}
                 scrollContainerRef={scrollContainerRef}
                 isPreviewMode={true}
+                onPromptFill={!isShared ? setChatInputValue : undefined}
+                threadId={threadId}
               />
             </div>
           </div>
 
           {/* Compact Chat Input or Playback Controls */}
           {!isShared && (
-            <div className="flex-shrink-0 border-t border-border/20 bg-background p-4">
+            <div className="flex-shrink-0 border-t border-border/20  p-4">
               <ChatInput
                 onSubmit={handleSubmitMessage}
                 placeholder={t('describeWhatYouNeed')}
@@ -1028,6 +1068,8 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
                 showScrollToBottomIndicator={showScrollToBottom}
                 onScrollToBottom={scrollToBottom}
                 threadId={threadId}
+                value={chatInputValue}
+                onChange={setChatInputValue}
               />
             </div>
           )}
@@ -1066,6 +1108,46 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
   }
 
   // Full layout version for dedicated thread pages
+  // Prepare ChatInput component
+  const chatInputElement = !isShared ? (
+    <div className={cn('mx-auto', isMobile ? 'w-full' : 'max-w-3xl')}>
+      <ChatInput
+        onSubmit={handleSubmitMessage}
+        placeholder={t('describeWhatYouNeed')}
+        loading={isSending}
+        disabled={isSending}
+        isAgentRunning={
+          agentStatus === 'running' || agentStatus === 'connecting'
+        }
+        onStopAgent={handleStopAgent}
+        autoFocus={!isLoading}
+        enableAdvancedConfig={false}
+        onFileBrowse={handleOpenFileViewer}
+        sandboxId={sandboxId || undefined}
+        projectId={projectId}
+        messages={messages}
+        agentName={agent && agent.name}
+        selectedAgentId={selectedAgentId}
+        onAgentSelect={handleAgentSelect}
+        threadId={threadId}
+        hideAgentSelection={!!configuredAgentId}
+        toolCalls={toolCalls}
+        toolCallIndex={currentToolIndex}
+        showToolPreview={!isSidePanelOpen && toolCalls.length > 0}
+        onExpandToolPreview={() => {
+          setIsSidePanelOpen(true);
+          userClosedPanelRef.current = false;
+        }}
+        defaultShowSnackbar="tokens"
+        showScrollToBottomIndicator={showScrollToBottom}
+        onScrollToBottom={scrollToBottom}
+        bgColor="bg-card"
+        value={chatInputValue}
+        onChange={setChatInputValue}
+      />
+    </div>
+  ) : undefined;
+
   return (
     <>
       <ThreadLayout
@@ -1096,12 +1178,13 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
         renderAssistantMessage={toolViewAssistant}
         renderToolResult={toolViewResult}
         isLoading={!initialLoadCompleted || isLoading}
-        debugMode={debugMode}
         isMobile={isMobile}
         initialLoadCompleted={initialLoadCompleted}
         agentName={agent && agent.name}
         disableInitialAnimation={!initialLoadCompleted && toolCalls.length > 0}
         variant={isShared ? 'shared' : 'default'}
+        chatInput={chatInputElement}
+        leftSidebarState={leftSidebarState}
       >
         <ThreadContent
           messages={isShared ? playback.playbackState.visibleMessages : messages}
@@ -1118,64 +1201,12 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
           streamHookStatus={streamHookStatus}
           sandboxId={sandboxId}
           project={project}
-          debugMode={debugMode}
           agentName={agent && agent.name}
           agentAvatar={undefined}
           scrollContainerRef={scrollContainerRef}
           threadId={threadId}
+          onPromptFill={!isShared ? setChatInputValue : undefined}
         />
-
-        {!isShared && (
-          <div
-            className={cn(
-              'fixed bottom-0 z-10 bg-gradient-to-t from-background via-background/90 to-transparent px-4 pt-8',
-              isSidePanelAnimating
-                ? ''
-                : 'transition-all duration-200 ease-in-out',
-              leftSidebarState === 'expanded'
-                ? 'left-[94px] md:left-[320px]'
-                : 'left-[94px]',
-              isSidePanelOpen && !isMobile
-                ? 'right-[90%] sm:right-[450px] md:right-[500px] lg:right-[550px] xl:right-[650px]'
-                : 'right-0',
-              isMobile ? 'left-0 right-0' : '',
-            )}
-          >
-            <div className={cn('mx-auto', isMobile ? 'w-full' : 'max-w-3xl')}>
-              <ChatInput
-                onSubmit={handleSubmitMessage}
-                placeholder={t('describeWhatYouNeed')}
-                loading={isSending}
-                disabled={isSending}
-                isAgentRunning={
-                  agentStatus === 'running' || agentStatus === 'connecting'
-                }
-                onStopAgent={handleStopAgent}
-                autoFocus={!isLoading}
-                enableAdvancedConfig={false}
-                onFileBrowse={handleOpenFileViewer}
-                sandboxId={sandboxId || undefined}
-                projectId={projectId}
-                messages={messages}
-                agentName={agent && agent.name}
-                selectedAgentId={selectedAgentId}
-                onAgentSelect={handleAgentSelect}
-                threadId={threadId}
-                hideAgentSelection={!!configuredAgentId}
-                toolCalls={toolCalls}
-                toolCallIndex={currentToolIndex}
-                showToolPreview={!isSidePanelOpen && toolCalls.length > 0}
-                onExpandToolPreview={() => {
-                  setIsSidePanelOpen(true);
-                  userClosedPanelRef.current = false;
-                }}
-                defaultShowSnackbar="tokens"
-                showScrollToBottomIndicator={showScrollToBottom}
-                onScrollToBottom={scrollToBottom}
-              />
-            </div>
-          </div>
-        )}
 
         {isShared && (
           <PlaybackFloatingControls

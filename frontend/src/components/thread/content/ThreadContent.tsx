@@ -21,9 +21,11 @@ import { ComposioUrlDetector } from './composio-url-detector';
 import { TaskCompletedFeedback } from '@/components/thread/tool-views/complete-tool/TaskCompletedFeedback';
 import { PromptExamples } from '@/components/shared/prompt-examples';
 
-// Flags to control prompt/answer rendering
-const ENABLE_ASK_PROMPT_SAMPLES = true;
-const ENABLE_COMPLETE_PROMPT_SAMPLES = true;
+// Configuration for prompt/answer rendering
+const PROMPT_SAMPLES_CONFIG = {
+  enableAskSamples: true,
+  enableCompleteSamples: true,
+} as const;
 
 // Helper function to render attachments (keeping original implementation for now)
 export function renderAttachments(attachments: string[], fileViewerHandler?: (filePath?: string, filePathList?: string[]) => void, sandboxId?: string, project?: Project) {
@@ -102,20 +104,11 @@ export function renderMarkdownContent(
     fileViewerHandler?: (filePath?: string, filePathList?: string[]) => void,
     sandboxId?: string,
     project?: Project,
-    debugMode?: boolean,
     isLatestMessage?: boolean,
     t?: (key: string) => string,
-    threadId?: string
+    threadId?: string,
+    onPromptFill?: (message: string) => void
 ) {
-    // If in debug mode, just display raw content in a pre tag
-    if (debugMode) {
-        return (
-            <pre className="text-xs font-mono whitespace-pre-wrap overflow-x-auto p-2 border border-border rounded-md bg-muted/30 text-foreground">
-                {content}
-            </pre>
-        );
-    }
-
     if (isNewXmlFormat(content)) {
         const contentParts: React.ReactNode[] = [];
         let lastIndex = 0;
@@ -182,12 +175,16 @@ export function renderMarkdownContent(
                                 </div>
                             )}
                             {/* Follow-up Answers */}
-                            {isLatestMessage && ENABLE_ASK_PROMPT_SAMPLES && followUpAnswersArray.length > 0 && (
+                            {isLatestMessage && PROMPT_SAMPLES_CONFIG.enableAskSamples && followUpAnswersArray.length > 0 && (
                                 <PromptExamples
                                     prompts={followUpAnswersArray.slice(0, 4).map(answer => ({ text: answer }))}
                                     onPromptClick={(answer) => {
-                                        // TODO: Handle follow-up answer click - could trigger a response
-                                        console.log('Follow-up answer clicked:', answer);
+                                        if (onPromptFill) {
+                                            console.log('Filling ChatInput with follow-up answer from ask tool:', answer);
+                                            onPromptFill(answer);
+                                        } else {
+                                            console.log('Follow-up answer clicked (no fill handler):', answer);
+                                        }
                                     }}
                                     variant="text"
                                     showTitle={true}
@@ -230,10 +227,14 @@ export function renderMarkdownContent(
                             {renderAttachments(attachmentArray, fileViewerHandler, sandboxId, project)}
                             <TaskCompletedFeedback
                                 taskSummary={completeText}
-                                followUpPrompts={isLatestMessage && ENABLE_COMPLETE_PROMPT_SAMPLES && followUpPromptsArray.length > 0 ? followUpPromptsArray : undefined}
+                                followUpPrompts={isLatestMessage && PROMPT_SAMPLES_CONFIG.enableCompleteSamples && followUpPromptsArray.length > 0 ? followUpPromptsArray : undefined}
                                 onFollowUpClick={(prompt) => {
-                                    // TODO: Handle follow-up click - could trigger a new message
-                                    console.log('Follow-up clicked:', prompt);
+                                    if (onPromptFill) {
+                                        console.log('Filling ChatInput with follow-up prompt from complete tool:', prompt);
+                                        onPromptFill(prompt);
+                                    } else {
+                                        console.log('Follow-up clicked (no fill handler):', prompt);
+                                    }
                                 }}
                                 samplePromptsTitle={t ? t('thread.samplePrompts') : 'Sample prompts'}
                                 threadId={threadId}
@@ -269,7 +270,7 @@ export function renderMarkdownContent(
                                     <IconComponent className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
                                 </div>
                                 <span className="font-mono text-xs text-foreground">{getUserFriendlyToolName(toolName)}</span>
-                                {paramDisplay && <span className="ml-1 text-muted-foreground truncate max-w-[200px]" title={paramDisplay}>{paramDisplay}</span>}
+                                {paramDisplay && <span className="ml-1 text-xs text-muted-foreground truncate max-w-[200px]" title={paramDisplay}>{paramDisplay}</span>}
                             </button>
                         </div>
                     );
@@ -379,7 +380,7 @@ export function renderMarkdownContent(
                             <IconComponent className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
                         </div>
                         <span className="font-mono text-xs text-foreground">{getUserFriendlyToolName(toolName)}</span>
-                        {paramDisplay && <span className="ml-1 text-muted-foreground truncate max-w-[200px]" title={paramDisplay}>{paramDisplay}</span>}
+                        {paramDisplay && <span className="ml-1 text-xs text-muted-foreground truncate max-w-[200px]" title={paramDisplay}>{paramDisplay}</span>}
                     </button>
                 </div>
             );
@@ -412,7 +413,6 @@ export interface ThreadContentProps {
     streamHookStatus?: string; // Add this prop
     sandboxId?: string; // Add sandboxId prop
     project?: Project; // Add project prop
-    debugMode?: boolean; // Add debug mode parameter
     isPreviewMode?: boolean;
     agentName?: string;
     agentAvatar?: React.ReactNode;
@@ -420,6 +420,7 @@ export interface ThreadContentProps {
     threadMetadata?: any; // Add thread metadata prop
     scrollContainerRef?: React.RefObject<HTMLDivElement>; // Add scroll container ref prop
     threadId?: string; // Add threadId prop
+    onPromptFill?: (message: string) => void; // Handler for filling ChatInput with prompt text from samples
 }
 
 export const ThreadContent: React.FC<ThreadContentProps> = ({
@@ -437,7 +438,6 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
     streamHookStatus = "idle",
     sandboxId,
     project,
-    debugMode = false,
     isPreviewMode = false,
     agentName = 'Suna',
     agentAvatar = <KortixLogo size={16} />,
@@ -445,6 +445,7 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
     threadMetadata,
     scrollContainerRef,
     threadId,
+    onPromptFill,
 }) => {
     const messagesContainerRef = useRef<HTMLDivElement>(null);
     const latestMessageRef = useRef<HTMLDivElement>(null);
@@ -457,8 +458,8 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
     const { preloadFiles } = useFilePreloader();
 
     const containerClassName = isPreviewMode
-        ? "flex-1 overflow-y-auto scrollbar-thin scrollbar-track-secondary/0 scrollbar-thumb-primary/10 scrollbar-thumb-rounded-full hover:scrollbar-thumb-primary/10 px-6 py-4 pb-0"
-        : "flex-1 overflow-y-auto scrollbar-thin scrollbar-track-secondary/0 scrollbar-thumb-primary/10 scrollbar-thumb-rounded-full hover:scrollbar-thumb-primary/10 px-6 py-4 pb-0 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60";
+        ? "flex-1 overflow-y-auto scrollbar-hide px-4 py-4 pb-0"
+        : "flex-1 overflow-y-auto scrollbar-hide px-4 py-4 pb-0 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60";
 
     // In playback mode, we use visibleMessages instead of messages
     const displayMessages = readOnly && visibleMessages ? visibleMessages : messages;
@@ -509,9 +510,10 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
         };
     }, [threadMetadata, displayMessages, agentName, agentAvatar]);
 
-    // Simplified scroll handler - flex-column-reverse handles positioning
+    // Scroll handler - trigger parent scroll detection if needed
     const handleScroll = useCallback(() => {
-        // No scroll logic needed with flex-column-reverse
+        // Scroll event will bubble up, parent component handles detection
+        // No additional logic needed here
     }, []);
 
     // No scroll-to-bottom needed with flex-column-reverse
@@ -590,10 +592,10 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                 // Render scrollable content container with column-reverse
                 <div
                     ref={scrollContainerRef || messagesContainerRef}
-                    className={`${containerClassName} flex flex-col-reverse ${shouldJustifyToTop ? 'justify-end min-h-full' : ''}`}
+                    className={`${containerClassName} min-h-0 flex flex-col-reverse ${shouldJustifyToTop ? 'justify-end min-h-full' : ''}`}
                     onScroll={handleScroll}
                 >
-                    <div ref={contentRef} className="mx-auto max-w-3xl md:px-8 min-w-0 w-full">
+                    <div ref={contentRef} className="mx-auto max-w-3xl min-w-0 w-full pl-6 pr-6">
                         <div className="space-y-8 min-w-0">
                             {(() => {
 
@@ -770,19 +772,6 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                             }
                                         })();
 
-                                        // In debug mode, display raw message content
-                                        if (debugMode) {
-                                            return (
-                                                <div key={group.key} className="flex justify-end">
-                                                    <div className="flex max-w-[85%] rounded-2xl bg-card px-4 py-3 break-words overflow-hidden">
-                                                        <pre className="text-xs font-mono whitespace-pre-wrap overflow-x-auto min-w-0 flex-1">
-                                                            {message.content}
-                                                        </pre>
-                                                    </div>
-                                                </div>
-                                            );
-                                        }
-
                                         // Extract attachments from the message content
                                         const attachmentsMatch = messageContent.match(/\[Uploaded File: (.*?)\]/g);
                                         const attachments = attachmentsMatch
@@ -826,33 +815,6 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                                     <div className="flex max-w-[90%] text-sm break-words overflow-hidden">
                                                         <div className="space-y-2 min-w-0 flex-1">
                                                             {(() => {
-                                                                // In debug mode, just show raw messages content
-                                                                if (debugMode) {
-                                                                    return group.messages.map((message, msgIndex) => {
-                                                                        const msgKey = message.message_id || `raw-msg-${msgIndex}`;
-                                                                        return (
-                                                                            <div key={msgKey} className="mb-4">
-                                                                                <div className="text-xs font-medium text-muted-foreground mb-1">
-                                                                                    Type: {message.type} | ID: {message.message_id || 'no-id'}
-                                                                                </div>
-                                                                                <pre className="text-xs font-mono whitespace-pre-wrap overflow-x-auto p-2 border border-border rounded-md bg-muted/30">
-                                                                                    {JSON.stringify(message.content, null, 2)}
-                                                                                </pre>
-                                                                                {message.metadata && message.metadata !== '{}' && (
-                                                                                    <div className="mt-2">
-                                                                                        <div className="text-xs font-medium text-muted-foreground mb-1">
-                                                                                            Metadata:
-                                                                                        </div>
-                                                                                        <pre className="text-xs font-mono whitespace-pre-wrap overflow-x-auto p-2 border border-border rounded-md bg-muted/30">
-                                                                                            {JSON.stringify(message.metadata, null, 2)}
-                                                                                        </pre>
-                                                                                    </div>
-                                                                                )}
-                                                                            </div>
-                                                                        );
-                                                                    });
-                                                                }
-
                                                                 const toolResultsMap = new Map<string | null, UnifiedMessage[]>();
                                                                 group.messages.forEach(msg => {
                                                                     if (msg.type === 'tool') {
@@ -894,10 +856,10 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                                                             handleOpenFileViewer,
                                                                             sandboxId,
                                                                             project,
-                                                                            debugMode,
                                                                             isLatestMessage,
                                                                             t,
-                                                                            threadId
+                                                                            threadId,
+                                                                            onPromptFill
                                                                         );
 
                                                                         elements.push(
@@ -918,15 +880,6 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                                             {groupIndex === finalGroupedMessages.length - 1 && !readOnly && (streamHookStatus === 'streaming' || streamHookStatus === 'connecting') && (
                                                                 <div className="mt-2">
                                                                     {(() => {
-                                                                        // In debug mode, show raw streaming content
-                                                                        if (debugMode && streamingTextContent) {
-                                                                            return (
-                                                                                <pre className="text-xs font-mono whitespace-pre-wrap overflow-x-auto p-2 border border-border rounded-md bg-muted/30">
-                                                                                    {streamingTextContent}
-                                                                                </pre>
-                                                                            );
-                                                                        }
-
                                                                         let detectedTag: string | null = null;
                                                                         let tagStartIndex = -1;
                                                                         if (streamingTextContent) {
@@ -1069,14 +1022,7 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
 
                                                                         return (
                                                                             <>
-                                                                                {/* In debug mode, show raw streaming content */}
-                                                                                {debugMode && streamingText ? (
-                                                                                    <pre className="text-xs font-mono whitespace-pre-wrap overflow-x-auto p-2 border border-border rounded-md bg-muted/30">
-                                                                                        {streamingText}
-                                                                                    </pre>
-                                                                                ) : (
-                                                                                    <>
-                                                                                        {textBeforeTag && (
+                                                                                {textBeforeTag && (
                                                                                             <ComposioUrlDetector content={textBeforeTag} className="text-sm prose prose-sm dark:prose-invert chat-markdown max-w-none [&>:first-child]:mt-0 prose-headings:mt-3 break-words overflow-wrap-anywhere" />
                                                                                         )}
 
@@ -1101,11 +1047,21 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                                                                                 startTime={Date.now()} // Tool just started now
                                                                                             />
                                                                                         ) : null}
-                                                                                    </>
-                                                                                )}
                                                                             </>
                                                                         );
                                                                     })()}
+                                                                </div>
+                                                            )}
+
+                                                            {/* Show loader when agent is running but not streaming, inside the last assistant group */}
+                                                            {groupIndex === finalGroupedMessages.length - 1 && 
+                                                                !readOnly && 
+                                                                (agentStatus === 'running' || agentStatus === 'connecting') && 
+                                                                !streamingTextContent && 
+                                                                !streamingToolCall &&
+                                                                (streamHookStatus === 'streaming' || streamHookStatus === 'connecting') && (
+                                                                <div className="mt-2">
+                                                                    <AgentLoader />
                                                                 </div>
                                                             )}
                                                         </div>
@@ -1117,9 +1073,11 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                     return null;
                                 });
                             })()}
-                            {((agentStatus === 'running' || agentStatus === 'connecting') && !streamingTextContent &&
+                            {/* Show loader as new assistant group only when there's no assistant group (last message is user or no messages) and agent is running */}
+                            {((agentStatus === 'running' || agentStatus === 'connecting') && !streamingTextContent && !streamingToolCall &&
                                 !readOnly &&
-                                (messages.length === 0 || messages[messages.length - 1].type === 'user')) && (
+                                (streamHookStatus === 'streaming' || streamHookStatus === 'connecting') &&
+                                (displayMessages.length === 0 || displayMessages[displayMessages.length - 1].type === 'user')) && (
                                     <div ref={latestMessageRef} className='w-full h-22 rounded'>
                                         <div className="flex flex-col gap-2">
                                             {/* Logo positioned above the loader */}
@@ -1190,7 +1148,7 @@ export const ThreadContent: React.FC<ThreadContentProps> = ({
                                     </div>
                                 </div>
                             )}
-                            <div className="!h-48" />
+                            <div className="!h-8" />
                         </div>
                     </div>
                 </div>
