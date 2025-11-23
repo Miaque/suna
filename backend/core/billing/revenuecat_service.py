@@ -5,9 +5,11 @@ from decimal import Decimal
 import hmac
 import hashlib
 import httpx
+import json
 from core.services.supabase import DBConnection
 from core.utils.logger import logger
 from core.utils.config import config
+from core.utils.distributed_lock import WebhookLock, DistributedLock
 from .credit_manager import credit_manager
 from .config import get_tier_by_name, CREDITS_PER_DOLLAR
 
@@ -25,10 +27,27 @@ class RevenueCatService:
             if not self._verify_webhook_signature(body_bytes, signature):
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
             
-            event_type = webhook_data.get('event', {}).get('type')
-            await self._route_webhook_event(event_type, webhook_data)
+            event = webhook_data.get('event', {})
+            event_type = event.get('type')
+            event_id = event.get('id') or f"rc_{event.get('app_user_id')}_{event.get('event_timestamp_ms')}"
             
-            return {'status': 'success'}
+            can_process, reason = await WebhookLock.check_and_mark_webhook_processing(
+                event_id, 
+                event_type,
+                payload=webhook_data
+            )
+            
+            if not can_process:
+                logger.info(f"[REVENUECAT] Skipping event {event_id}: {reason}")
+                return {'status': 'success', 'message': f'Event already processed or in progress: {reason}'}
+            
+            try:
+                await self._route_webhook_event(event_type, webhook_data)
+                await WebhookLock.mark_webhook_completed(event_id)
+                return {'status': 'success'}
+            except Exception as e:
+                await WebhookLock.mark_webhook_failed(event_id, str(e))
+                raise
             
         except Exception as e:
             logger.error(f"[REVENUECAT] Error processing webhook: {str(e)}")
@@ -83,16 +102,6 @@ class RevenueCatService:
         if not self._validate_product_id(product_id):
             logger.error(f"[REVENUECAT] Skipping INITIAL_PURCHASE for invalid product: {product_id}")
             return
-        
-        logger.info(
-            f"[REVENUECAT INITIAL_PURCHASE] ========================================\n"
-            f"[REVENUECAT INITIAL_PURCHASE] Handling initial purchase\n"
-            f"[REVENUECAT INITIAL_PURCHASE] User: {app_user_id}\n"
-            f"[REVENUECAT INITIAL_PURCHASE] Product: {product_id}\n"
-            f"[REVENUECAT INITIAL_PURCHASE] Price: ${price}\n"
-            f"[REVENUECAT INITIAL_PURCHASE] Full event data: {event}\n"
-            f"[REVENUECAT INITIAL_PURCHASE] ========================================"
-        )
         
         try:
             await self._apply_subscription_change(
@@ -163,15 +172,7 @@ class RevenueCatService:
         app_user_id = event.get('app_user_id')
         new_product_id = event.get('new_product_id')
         old_product_id = event.get('product_id')
-        
-        logger.info(
-            f"[REVENUECAT PRODUCT_CHANGE] Event details:\n"
-            f"  - app_user_id: {app_user_id}\n"
-            f"  - old_product_id: {old_product_id}\n"
-            f"  - new_product_id: {new_product_id}\n"
-            f"  - Full event: {event}"
-        )
-        
+
         if not new_product_id:
             logger.warning(
                 f"[REVENUECAT PRODUCT_CHANGE] No new_product_id - this might be a "
@@ -217,10 +218,20 @@ class RevenueCatService:
         app_user_id = event.get('app_user_id')
         product_id = event.get('product_id')
         price = event.get('price', 0)
+        transaction_id = event.get('id') or event.get('transaction_id')
+        purchased_at_ms = event.get('purchased_at_ms') or event.get('event_timestamp_ms')
         
-        logger.info(f"[REVENUECAT ONE_TIME] User {app_user_id} purchased credits: ${price}")
         
-        await self._add_one_time_credits(app_user_id, price)
+        if not transaction_id:
+            logger.error(f"[REVENUECAT ONE_TIME] No transaction ID found, using fallback")
+            transaction_id = f"rc_topup_{app_user_id}_{purchased_at_ms}"
+        
+        await self._add_one_time_credits(
+            app_user_id=app_user_id,
+            price=price,
+            product_id=product_id,
+            transaction_id=transaction_id
+        )
     
     async def _handle_subscription_paused(self, webhook_data: Dict) -> None:
         event = webhook_data.get('event', {})
@@ -246,17 +257,17 @@ class RevenueCatService:
         
         new_app_user_id = transferred_to[0] if transferred_to else None
         
-        logger.info(
-            f"[REVENUECAT TRANSFER] Parsed fields:\n"
-            f"  - transferred_to: {transferred_to}\n"
-            f"  - new_app_user_id: {new_app_user_id}\n"
-            f"  - transferred_from: {transferred_from}\n"
-            f"  - product_id: {product_id}\n"
-            f"  - price: {price}"
-        )
+        transferred_from_valid = [
+            user_id for user_id in transferred_from 
+            if not user_id.startswith('$RCAnonymousID:')
+        ]
+        
         
         if not new_app_user_id:
             logger.error(f"[REVENUECAT TRANSFER] Missing new_app_user_id (transferred_to array is empty), skipping")
+            return
+        
+        if new_app_user_id.startswith('$RCAnonymousID:'):
             return
             
         if not product_id:
@@ -264,8 +275,8 @@ class RevenueCatService:
             db = DBConnection()
             client = await db.client
             
-            if transferred_from:
-                old_app_user_id = transferred_from[0]
+            if transferred_from_valid:
+                old_app_user_id = transferred_from_valid[0]
                 old_account = await self._get_credit_account(client, old_app_user_id)
                 if old_account and old_account.get('revenuecat_product_id'):
                     product_id = old_account['revenuecat_product_id']
@@ -290,18 +301,13 @@ class RevenueCatService:
                 logger.error(f"[REVENUECAT TRANSFER] Cannot determine product_id from either account after retries, skipping")
                 return
         
-        logger.info(
-            f"[REVENUECAT TRANSFER] ========================================\n"
-            f"[REVENUECAT TRANSFER] Subscription transferred TO: {new_app_user_id}\n"
-            f"[REVENUECAT TRANSFER] FROM: {transferred_from}\n"
-            f"[REVENUECAT TRANSFER] Product: {product_id}\n"
-            f"[REVENUECAT TRANSFER] ========================================"
-        )
-        
         db = DBConnection()
         client = await db.client
         
-        for old_app_user_id in transferred_from:
+        if not transferred_from_valid:
+            logger.info(f"[REVENUECAT TRANSFER] No valid (non-anonymous) accounts to transfer from")
+        
+        for old_app_user_id in transferred_from_valid:
             logger.info(f"[REVENUECAT TRANSFER] Removing subscription from old account: {old_app_user_id}")
             
             old_account = await self._get_credit_account(client, old_app_user_id)
@@ -336,7 +342,7 @@ class RevenueCatService:
         
         logger.info(
             f"[REVENUECAT TRANSFER] ✅ Transfer complete: "
-            f"{transferred_from} → {new_app_user_id}"
+            f"{transferred_from_valid} → {new_app_user_id}"
         )
     
     # ============================================================================
@@ -351,45 +357,21 @@ class RevenueCatService:
         event_type: str,
         webhook_data: Dict
     ) -> None:
-        logger.info(
-            f"[REVENUECAT] ========================================\n"
-            f"[REVENUECAT] _apply_subscription_change START\n"
-            f"[REVENUECAT] User: {app_user_id}\n"
-            f"[REVENUECAT] Product: {product_id}\n"
-            f"[REVENUECAT] Event Type: {event_type}\n"
-            f"[REVENUECAT] ========================================"
-        )
-        
+
         tier_name, tier_info = self._get_tier_info(product_id)
         if not tier_info:
             logger.error(f"[REVENUECAT] ❌ Unknown tier for product: {product_id}, ABORTING")
             return
         
-        logger.info(
-            f"[REVENUECAT] Tier mapping successful:\n"
-            f"  - Tier Name: {tier_name}\n"
-            f"  - Display Name: {tier_info.display_name}\n"
-            f"  - Credits: {tier_info.monthly_credits}"
-        )
-        
         period_type = self._get_period_type(product_id)
         credits_amount = Decimal(str(tier_info.monthly_credits))
         
         if period_type == 'yearly':
-            logger.info(f"[REVENUECAT] Yearly plan detected - granting 12x monthly credits")
             credits_amount *= 12
         
         event = webhook_data.get('event', {})
         subscription_id = event.get('original_transaction_id') or event.get('id', '')
         revenuecat_event_id = event.get('id')
-        
-        logger.info(
-            f"[REVENUECAT] Extracted data:\n"
-            f"  - Period Type: {period_type}\n"
-            f"  - Credits: ${credits_amount}\n"
-            f"  - Subscription ID: {subscription_id}\n"
-            f"  - Event ID: {revenuecat_event_id}"
-        )
         
         db = DBConnection()
         client = await db.client
@@ -666,20 +648,102 @@ class RevenueCatService:
             f"User keeps current plan benefits until then."
         )
     
-    async def _add_one_time_credits(self, app_user_id: str, price: float) -> None:
-        credits_to_add = Decimal(str(price))
+    async def _add_one_time_credits(
+        self,
+        app_user_id: str,
+        price: float,
+        product_id: str,
+        transaction_id: str
+    ) -> None:
+        lock_key = f"revenuecat_topup:{app_user_id}:{transaction_id}"
+        lock = DistributedLock(lock_key, timeout_seconds=60)
         
-        await credit_manager.add_credits(
-            account_id=app_user_id,
-            amount=credits_to_add,
-            is_expiring=False,
-            description=f"Credit purchase via RevenueCat: ${price}",
-            type='purchase'
-        )
+        acquired = await lock.acquire(wait=True, wait_timeout=10)
+        if not acquired:
+            logger.warning(
+                f"[REVENUECAT ONE_TIME] Could not acquire lock for {app_user_id}, "
+                f"transaction {transaction_id} may be processing in another thread"
+            )
+            return
         
-        logger.info(
-            f"[REVENUECAT ONE_TIME] Added ${credits_to_add} credits to {app_user_id}"
-        )
+        try:
+            db = DBConnection()
+            client = await db.client
+            
+            existing = await client.from_('credit_purchases').select(
+                'id, revenuecat_transaction_id, amount_dollars, created_at, status'
+            ).eq('account_id', app_user_id).eq(
+                'revenuecat_transaction_id', transaction_id
+            ).execute()
+            
+            if existing.data:
+                existing_purchase = existing.data[0]
+                logger.warning(
+                    f"[REVENUECAT ONE_TIME] ⛔ Duplicate transaction prevented for {app_user_id}\n"
+                    f"Transaction {transaction_id} was already processed at {existing_purchase['created_at']}\n"
+                    f"Status: {existing_purchase['status']}\n"
+                    f"Amount: ${existing_purchase['amount_dollars']}"
+                )
+                return
+            
+            credits_to_add = Decimal(str(price))
+            
+            purchase_id = await client.from_('credit_purchases').insert({
+                'account_id': app_user_id,
+                'amount_dollars': float(price),
+                'provider': 'revenuecat',
+                'revenuecat_transaction_id': transaction_id,
+                'revenuecat_product_id': product_id,
+                'status': 'pending',
+                'metadata': {
+                    'product_id': product_id,
+                    'transaction_id': transaction_id
+                },
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }).execute()
+            
+            result = await credit_manager.add_credits(
+                account_id=app_user_id,
+                amount=credits_to_add,
+                is_expiring=False,
+                description=f"Credit topup via RevenueCat: ${price} ({product_id})",
+                type='purchase'
+            )
+            
+            if result.get('duplicate_prevented'):
+                logger.warning(
+                    f"[REVENUECAT ONE_TIME] Credit manager detected duplicate for {app_user_id}"
+                )
+            
+            await client.from_('credit_purchases').update({
+                'status': 'completed',
+                'completed_at': datetime.now(timezone.utc).isoformat()
+            }).eq('revenuecat_transaction_id', transaction_id).execute()
+            
+            logger.info(
+                f"[REVENUECAT ONE_TIME] ✅ Added ${credits_to_add} credits to {app_user_id}\n"
+                f"Transaction ID: {transaction_id}\n"
+                f"Product: {product_id}\n"
+                f"New balance: ${result.get('balance_after', 'unknown')}"
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"[REVENUECAT ONE_TIME] ❌ Failed to add credits for {app_user_id}: {e}",
+                exc_info=True
+            )
+            
+            try:
+                await client.from_('credit_purchases').update({
+                    'status': 'failed',
+                    'error_message': str(e)
+                }).eq('revenuecat_transaction_id', transaction_id).execute()
+            except:
+                pass
+            
+            raise
+        finally:
+            await lock.release()
     
     async def _cancel_existing_stripe_subscription(
         self,
