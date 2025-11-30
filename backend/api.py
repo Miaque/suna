@@ -16,6 +16,7 @@ from core.utils.logger import logger, structlog
 import time
 from collections import OrderedDict
 import os
+import psutil
 
 from pydantic import BaseModel
 import uuid
@@ -27,7 +28,7 @@ from core.billing.api import router as billing_router
 from core.setup import router as setup_router, webhook_router
 from core.admin.admin_api import router as admin_router
 from core.admin.billing_admin_api import router as billing_admin_router
-from core.admin.master_password_api import router as master_password_router
+from core.admin.notification_admin_api import router as notification_admin_router
 from core.services import transcription as transcription_api
 import sys
 from core.triggers import api as triggers_api
@@ -50,10 +51,13 @@ MAX_CONCURRENT_IPS = 25
 
 # Background task handle for CloudWatch metrics
 _queue_metrics_task = None
+_memory_watchdog_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.debug(f"Starting up FastAPI application with instance ID: {instance_id} in {config.ENV_MODE.value} mode")
+    global _queue_metrics_task, _memory_watchdog_task
+    env_mode = config.ENV_MODE.value if config.ENV_MODE else "unknown"
+    logger.debug(f"Starting up FastAPI application with instance ID: {instance_id} in {env_mode} mode")
     try:
         await db.initialize()
         
@@ -91,10 +95,12 @@ async def lifespan(app: FastAPI):
         composio_api.initialize(db)
         
         # Start CloudWatch queue metrics publisher (production only)
-        global _queue_metrics_task
         if config.ENV_MODE == EnvMode.PRODUCTION:
             from core.services import queue_metrics
             _queue_metrics_task = asyncio.create_task(queue_metrics.start_cloudwatch_publisher())
+        
+        # Start memory watchdog for observability
+        _memory_watchdog_task = asyncio.create_task(_memory_watchdog())
         
         yield
         
@@ -106,6 +112,14 @@ async def lifespan(app: FastAPI):
             _queue_metrics_task.cancel()
             try:
                 await _queue_metrics_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop memory watchdog task
+        if _memory_watchdog_task is not None:
+            _memory_watchdog_task.cancel()
+            try:
+                await _memory_watchdog_task
             except asyncio.CancelledError:
                 pass
         
@@ -202,7 +216,7 @@ api_router.include_router(webhook_router)  # Webhooks at /api/webhooks/*
 api_router.include_router(api_keys_api.router)
 api_router.include_router(billing_admin_router)
 api_router.include_router(admin_router)
-api_router.include_router(master_password_router)
+api_router.include_router(notification_admin_router)
 
 from core.mcp_module import api as mcp_api
 from core.credentials import api as credentials_api
@@ -234,6 +248,9 @@ api_router.include_router(google_slides_router)
 
 from core.google.google_docs_api import router as google_docs_router
 api_router.include_router(google_docs_router)
+
+from core.referrals import router as referrals_router
+api_router.include_router(referrals_router)
 
 @api_router.get("/health", summary="Health Check", operation_id="health_check", tags=["system"])
 async def health_check():
@@ -276,6 +293,32 @@ async def health_check_docker():
 
 
 app.include_router(api_router, prefix="/api")
+
+
+async def _memory_watchdog():
+    """Monitor worker memory usage and log warnings when thresholds are exceeded."""
+    try:
+        while True:
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_mb = mem_info.rss / 1024 / 1024  # Convert to MB
+                
+                # Log warning at 6GB (75% of 8GB hard limit)
+                if mem_mb > 6000:
+                    logger.warning(f"Worker memory high: {mem_mb:.0f}MB (instance: {instance_id})")
+                # Log info at 5GB (62.5% of 8GB hard limit) for visibility
+                elif mem_mb > 5000:
+                    logger.info(f"Worker memory: {mem_mb:.0f}MB (instance: {instance_id})")
+                
+            except Exception as e:
+                logger.debug(f"Memory watchdog error: {e}")
+            
+            await asyncio.sleep(60)  # Check every minute
+    except asyncio.CancelledError:
+        logger.debug("Memory watchdog cancelled")
+    except Exception as e:
+        logger.error(f"Memory watchdog failed: {e}")
 
 
 if __name__ == "__main__":
