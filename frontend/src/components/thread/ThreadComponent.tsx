@@ -163,6 +163,13 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
     userClosedPanelRef,
   } = useThreadToolCalls(messages, setLeftSidebarOpen, agentStatus, compact);
 
+  // Memoized callback for closing side panel to prevent unnecessary re-renders
+  const handleSidePanelClose = useCallback(() => {
+    setIsSidePanelOpen(false);
+    userClosedPanelRef.current = true;
+    setAutoOpenedPanel(true);
+  }, [setIsSidePanelOpen, setAutoOpenedPanel]);
+
   // Billing hooks - always call unconditionally, but disable for unauthenticated/shared
   const billingModal = useBillingModal();
   const threadBilling = useThreadBilling(
@@ -519,9 +526,6 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
       if (!message.trim() || isShared || !addUserMessageMutation || !startAgentMutation) return;
       setIsSending(true);
 
-      // Clear the chat input value
-      setChatInputValue('');
-
       // Store the message to add optimistically when agent starts running
       pendingMessageRef.current = message;
 
@@ -582,6 +586,9 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
           throw new Error(`Failed to start agent: ${error?.message || error}`);
         }
 
+        // Message sent successfully - now clear the input
+        setChatInputValue('');
+
         const agentResult = results[1].value;
         setUserInitiatedRun(true);
         setAgentRunId(agentResult.agent_run_id);
@@ -593,6 +600,7 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
         ) {
           toast.error(err instanceof Error ? err.message : 'Operation failed');
         }
+        // Keep the input value on error so user doesn't lose their message
       } finally {
         setIsSending(false);
       }
@@ -956,11 +964,7 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
         agentStatus={agentStatus}
         currentToolIndex={currentToolIndex}
         onSidePanelNavigate={handleSidePanelNavigate}
-        onSidePanelClose={() => {
-          setIsSidePanelOpen(false);
-          userClosedPanelRef.current = true;
-          setAutoOpenedPanel(true);
-        }}
+        onSidePanelClose={handleSidePanelClose}
         renderAssistantMessage={toolViewAssistant}
         renderToolResult={toolViewResult}
         isLoading={!initialLoadCompleted || isLoading}
@@ -996,11 +1000,7 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
           agentStatus={agentStatus}
           currentToolIndex={currentToolIndex}
           onSidePanelNavigate={handleSidePanelNavigate}
-          onSidePanelClose={() => {
-            setIsSidePanelOpen(false);
-            userClosedPanelRef.current = true;
-            setAutoOpenedPanel(true);
-          }}
+          onSidePanelClose={handleSidePanelClose}
           renderAssistantMessage={toolViewAssistant}
           renderToolResult={toolViewResult}
           isLoading={!initialLoadCompleted || isLoading}
@@ -1176,11 +1176,7 @@ export function ThreadComponent({ projectId, threadId, compact = false, configur
         agentStatus={agentStatus}
         currentToolIndex={currentToolIndex}
         onSidePanelNavigate={handleSidePanelNavigate}
-        onSidePanelClose={() => {
-          setIsSidePanelOpen(false);
-          userClosedPanelRef.current = true;
-          setAutoOpenedPanel(true);
-        }}
+        onSidePanelClose={handleSidePanelClose}
         renderAssistantMessage={toolViewAssistant}
         renderToolResult={toolViewResult}
         isLoading={!initialLoadCompleted || isLoading}

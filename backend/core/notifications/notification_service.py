@@ -5,16 +5,53 @@ from core.utils.config import config
 from .novu_service import novu_service
 from .presence_service import presence_service
 from .models import UserNotificationSettings
+from core.services.email import email_service
+
+KORTIX_HELLO_EMAIL = 'hello@kortix.com'
 
 class NotificationService:
     def __init__(self):
         self.db = DBConnection()
         self.novu = novu_service
-        # In-memory storage for device tokens (consider moving to database for production)
         self._device_tokens: Dict[str, Dict[str, Any]] = {}
-        # In-memory storage for notification settings
         self._notification_settings: Dict[str, UserNotificationSettings] = {}
-    
+
+    async def send_referral_code_notification(
+        self,
+        recipient_email: str,
+        referral_url: str,
+        inviter_id: str,
+    ) -> Dict[str, Any]:
+        try:
+            inviter_info = await self._get_account_info(inviter_id)
+            
+            if not inviter_info or not inviter_info.get("email"):
+                logger.error(f"No account found for inviter id: {inviter_id}")
+                return {"success": False, "error": "Inviter not found"}
+
+            inviter_name = inviter_info.get("name", "A friend")
+            
+            recipient_email_clean = recipient_email.strip().lower()
+            recipient_name = self._extract_name_from_email(recipient_email_clean)
+            
+            success = email_service.send_referral_email(
+                recipient_email=recipient_email_clean,
+                recipient_name=recipient_name,
+                sender_name=inviter_name,
+                referral_url=referral_url
+            )
+
+            if success:
+                logger.info(f"Referral code email sent to {recipient_email_clean} from {inviter_name}")
+                return {"success": True}
+            else:
+                logger.error(f"Failed to send referral email to {recipient_email_clean}")
+                return {"success": False, "error": "Failed to send email"}
+        
+        except Exception as e:
+            logger.error(f"Error sending referral code notification: {str(e)}")
+            return {"success": False, "error": str(e)}
+
     async def send_task_completion_notification(
         self,
         account_id: str,
@@ -483,21 +520,31 @@ class NotificationService:
         account_id: str,
         device_token: str,
         device_type: str = "mobile",
-        provider: str = "fcm"
+        provider: str = "expo"
     ) -> bool:
-        """Register a device token for push notifications."""
         try:
-            if account_id not in self._device_tokens:
-                self._device_tokens[account_id] = {}
+            result = await self.novu.register_push_token(
+                user_id=account_id,
+                provider_id=provider,
+                device_token=device_token,
+                device_type=device_type
+            )
             
-            self._device_tokens[account_id][device_token] = {
-                "device_type": device_type,
-                "provider": provider,
-                "registered_at": None  # Could add timestamp if needed
-            }
-            
-            logger.info(f"Device token registered for account {account_id}: {device_token[:20]}...")
-            return True
+            if result:
+                if account_id not in self._device_tokens:
+                    self._device_tokens[account_id] = {}
+                
+                self._device_tokens[account_id][device_token] = {
+                    "device_type": device_type,
+                    "provider": provider,
+                    "registered_at": None
+                }
+                
+                logger.info(f"✅ Device token registered with Novu for account {account_id}: {device_token[:20]}...")
+                return True
+            else:
+                logger.error(f"❌ Failed to register device token with Novu for account {account_id}")
+                return False
             
         except Exception as e:
             logger.error(f"Error registering device token: {str(e)}")
@@ -506,18 +553,28 @@ class NotificationService:
     async def unregister_device_token(
         self,
         account_id: str,
-        device_token: str
+        device_token: str,
+        provider: str = "expo"
     ) -> bool:
         """Unregister a device token for push notifications."""
         try:
-            if account_id in self._device_tokens:
-                if device_token in self._device_tokens[account_id]:
-                    del self._device_tokens[account_id][device_token]
-                    logger.info(f"Device token unregistered for account {account_id}")
-                    return True
+            result = await self.novu.unregister_push_token(
+                user_id=account_id,
+                provider_id=provider
+            )
             
-            logger.warning(f"Device token not found for account {account_id}")
-            return True  # Return True even if not found (idempotent)
+            if result:
+                if account_id in self._device_tokens:
+                    if device_token in self._device_tokens[account_id]:
+                        del self._device_tokens[account_id][device_token]
+                        logger.info(f"✅ Device token unregistered from Novu for account {account_id}")
+                        return True
+                
+                logger.info(f"Device token already removed for account {account_id}")
+                return True
+            else:
+                logger.error(f"❌ Failed to unregister device token from Novu for account {account_id}")
+                return False
             
         except Exception as e:
             logger.error(f"Error unregistering device token: {str(e)}")

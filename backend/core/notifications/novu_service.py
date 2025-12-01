@@ -278,7 +278,8 @@ class NovuService:
         payload: Optional[Dict[str, Any]] = None,
         subscriber_email: Optional[str] = None,
         subscriber_name: Optional[str] = None,
-        avatar: Optional[str] = None
+        avatar: Optional[str] = None,
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         if not self.enabled:
             logger.error(f"❌ Workflow skipped (Novu disabled in {config.ENV_MODE.value} mode): {workflow_id} - Set ENV_MODE to 'staging' or 'production' to enable")
@@ -302,7 +303,8 @@ class NovuService:
                             "name": subscriber_name,
                             "avatar": avatar
                         },
-                        payload=payload
+                        payload=payload,
+                        overrides=overrides
                     )
                 )
 
@@ -344,6 +346,38 @@ class NovuService:
             
         except Exception as e:
             logger.error(f"❌ Error registering push token: {str(e)}")
+            return False
+    
+    async def unregister_push_token(
+        self,
+        user_id: str,
+        provider_id: str,
+        integration_identifier: Optional[str] = None
+    ) -> bool:
+        if not self.enabled:
+            logger.debug(f"Skipping push token unregistration (Novu disabled in {config.ENV_MODE.value} mode)")
+            return True
+        
+        if not self.api_key:
+            logger.error("Cannot unregister push token: NOVU_SECRET_KEY not configured")
+            return False
+        
+        try:
+            credentials = {
+                "deviceTokens": []
+            }
+            
+            logger.info(f"🗑️  Unregistering push token for user {user_id[:8]}... with provider {provider_id}")
+            
+            return await self.update_subscriber_credentials(
+                user_id=user_id,
+                provider_id=provider_id,
+                credentials=credentials,
+                integration_identifier=integration_identifier
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ Error unregistering push token: {str(e)}")
             return False
     
     async def trigger_broadcast(
