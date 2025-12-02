@@ -1013,8 +1013,8 @@ export function PricingSection({
     }
 
     // Default to monthly if period is short or can't determine
-    console.log(`[BILLING-PERIOD-DEBUG] Defaulting to monthly`);
-    return 'monthly';
+    console.log(`[BILLING-PERIOD-DEBUG] Defaulting to yearly`);
+    return 'yearly';
   };
 
   const currentBillingPeriod = getCurrentBillingPeriod();
@@ -1103,7 +1103,7 @@ export function PricingSection({
   return (
     <section
       id="pricing"
-      className={cn("flex flex-col items-center justify-center w-full relative", noPadding ? "pb-0" : "pb-12")}
+      className={cn("scale-90 flex flex-col items-center justify-center w-full relative", noPadding ? "pb-0" : "pb-12")}
     >
       <div className="w-full mx-auto px-4 sm:px-6 flex flex-col">
         {/* Compact Header for Mobile */}
