@@ -22,6 +22,7 @@ import { useIsMobile } from '@/hooks/utils';
 import { useAuth } from '@/components/AuthProvider';
 import { config, isLocalMode, isStagingMode } from '@/lib/config';
 import { useInitiateAgentWithInvalidation } from '@/hooks/dashboard/use-initiate-agent';
+import { optimisticAgentStart } from '@/lib/api/agents';
 import { useAccountState, accountStateSelectors, invalidateAccountState } from '@/hooks/billing';
 import { getPlanName } from '@/components/billing/plan-utils';
 import { useAgents } from '@/hooks/agents/use-agents';
@@ -32,11 +33,12 @@ import { normalizeFilenameToNFC } from '@/lib/utils/unicode';
 import { toast } from 'sonner';
 import { useSunaModePersistence } from '@/stores/suna-modes-store';
 import { Button } from '../ui/button';
-import { X } from 'lucide-react';
+import { X, ChevronRight, HelpCircle } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import { NotificationDropdown } from '../notifications/notification-dropdown';
 import { UsageLimitsPopover } from './usage-limits-popover';
 import { useSidebar } from '@/components/ui/sidebar';
+import { DynamicGreeting } from '@/components/ui/dynamic-greeting';
 
 // Lazy load heavy components that aren't immediately visible
 const PlanSelectionModal = lazy(() => 
@@ -63,7 +65,6 @@ const CreditsDisplay = lazy(() =>
 
 const PENDING_PROMPT_KEY = 'pendingAgentPrompt';
 
-
 export function DashboardContent() {
   const t = useTranslations('dashboard');
   const tCommon = useTranslations('common');
@@ -72,11 +73,11 @@ export function DashboardContent() {
   const [inputValue, setInputValue] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showConfigDialog, setShowConfigDialog] = useState(false);
+  const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [configAgentId, setConfigAgentId] = useState<string | null>(null);
   const [isRedirecting, setIsRedirecting] = useState(false);
   const [autoSubmit, setAutoSubmit] = useState(false);
   
-  // Use centralized Suna modes persistence hook
   const {
     selectedMode,
     selectedCharts,
@@ -112,6 +113,9 @@ export function DashboardContent() {
   const chatInputRef = React.useRef<ChatInputHandles>(null);
   const initiateAgentMutation = useInitiateAgentWithInvalidation();
   const pricingModalStore = usePricingModalStore();
+  
+  const prefetchedRouteRef = React.useRef<string | null>(null);
+  const prefetchTimeoutRef = React.useRef<NodeJS.Timeout | null>(null);
 
   const { data: agentsResponse, isLoading: isLoadingAgents } = useAgents({
     limit: 50, // Changed from 100 to 50 to match other components
@@ -124,11 +128,11 @@ export function DashboardContent() {
     ? agents.find(agent => agent.agent_id === selectedAgentId)
     : null;
   const sunaAgent = agents.find(agent => agent.metadata?.is_suna_default === true);
-  const displayName = selectedAgent?.name || 'Suna';
+  const displayName = selectedAgent?.name || 'Kortix';
   const agentAvatar = undefined;
-  // Show Suna modes while loading (assume Suna is default) or when Suna agent is selected
+  // Show Kortix modes while loading (assume Kortix is default) or when Kortix agent is selected
   const isSunaAgent = isLoadingAgents 
-    ? true // Show Suna modes while loading
+    ? true // Show Kortix modes while loading
     : (selectedAgent?.metadata?.is_suna_default || (!selectedAgentId && sunaAgent !== undefined) || false);
 
   const threadQuery = useThreadQuery(initiatedThreadId || '');
@@ -275,18 +279,13 @@ export function DashboardContent() {
       localStorage.removeItem(PENDING_PROMPT_KEY);
 
       const formData = new FormData();
-      
-      // Always append prompt - it's required for new threads
-      // The message should never be empty due to validation above, but ensure we always send it
       const trimmedMessage = message.trim();
       if (!trimmedMessage && files.length === 0) {
         setIsSubmitting(false);
-        throw new Error('Prompt is required when starting a new agent');
+        throw new Error('Prompt is required when starting a new Worker');
       }
-      // Always append prompt (even if empty, backend will validate)
       formData.append('prompt', trimmedMessage || message);
 
-      // Add selected agent if one is chosen
       if (selectedAgentId) {
         formData.append('agent_id', selectedAgentId);
       }
@@ -299,10 +298,9 @@ export function DashboardContent() {
       if (options?.model_name && options.model_name.trim()) {
         formData.append('model_name', options.model_name.trim());
       }
-      formData.append('stream', 'true'); // Always stream for better UX
+      formData.append('stream', 'true');
       formData.append('enable_context_manager', String(options?.enable_context_manager ?? false));
 
-      // Debug logging
       console.log('[Dashboard] Starting agent with:', {
         prompt: message.substring(0, 100),
         promptLength: message.length,
@@ -311,14 +309,94 @@ export function DashboardContent() {
         filesCount: files.length,
       });
 
-      const result = await initiateAgentMutation.mutateAsync(formData);
-
-      if (result.thread_id) {
-        setInitiatedThreadId(result.thread_id);
-      } else {
-        throw new Error('Agent initiation did not return a thread_id.');
-      }
+      const threadId = crypto.randomUUID();
+      const projectId = crypto.randomUUID();
+      
       chatInputRef.current?.clearPendingFiles();
+      setIsRedirecting(true);
+      
+      sessionStorage.setItem('optimistic_prompt', trimmedMessage || message);
+      sessionStorage.setItem('optimistic_thread', threadId);
+      
+      router.push(`/projects/${projectId}/thread/${threadId}?new=true`);
+      
+      optimisticAgentStart({
+        thread_id: threadId,
+        project_id: projectId,
+        prompt: trimmedMessage || message,
+        files: files,
+        model_name: options?.model_name,
+        agent_id: selectedAgentId || undefined,
+        memory_enabled: true,
+      }).then(() => {
+        queryClient.invalidateQueries({ queryKey: ['threads', 'list'] });
+        queryClient.invalidateQueries({ queryKey: ['active-agent-runs'] });
+      }).catch((error) => {
+        console.error('Background agent start failed:', error);
+        
+        if (error instanceof BillingError || error?.status === 402) {
+          const message = error.detail?.message?.toLowerCase() || error.message?.toLowerCase() || '';
+          const originalMessage = error.detail?.message || error.message || '';
+          const isCreditsExhausted = 
+            message.includes('credit') ||
+            message.includes('balance') ||
+            message.includes('insufficient') ||
+            message.includes('out of credits') ||
+            message.includes('no credits');
+          
+          const balanceMatch = originalMessage.match(/balance is (-?\d+)\s*credits/i);
+          const balance = balanceMatch ? balanceMatch[1] : null;
+          
+          const alertTitle = isCreditsExhausted 
+            ? 'You ran out of credits'
+            : 'Pick the plan that works for you';
+          
+          const alertSubtitle = balance 
+            ? `Your current balance is ${balance} credits. Upgrade your plan to continue.`
+            : isCreditsExhausted 
+              ? 'Upgrade your plan to get more credits and continue using the AI assistant.'
+              : undefined;
+          
+          router.replace('/dashboard');
+          pricingModalStore.openPricingModal({ 
+            isAlert: true,
+            alertTitle,
+            alertSubtitle
+          });
+          return;
+        }
+        
+        if (error instanceof AgentRunLimitError) {
+          const { running_thread_ids, running_count } = error.detail;
+          router.replace('/dashboard');
+          setAgentLimitData({
+            runningCount: running_count,
+            runningThreadIds: running_thread_ids,
+          });
+          setShowAgentLimitDialog(true);
+          return;
+        }
+        
+        if (error instanceof ProjectLimitError) {
+          router.replace('/dashboard');
+          pricingModalStore.openPricingModal({ 
+            isAlert: true,
+            alertTitle: `${tBilling('reachedLimit')} ${tBilling('projectLimit', { current: error.detail.current_count, limit: error.detail.limit })}` 
+          });
+          return;
+        }
+        
+        if (error instanceof ThreadLimitError) {
+          router.replace('/dashboard');
+          pricingModalStore.openPricingModal({ 
+            isAlert: true,
+            alertTitle: `${tBilling('reachedLimit')} ${tBilling('threadLimit', { current: error.detail.current_count, limit: error.detail.limit })}` 
+          });
+          return;
+        }
+        
+        toast.error('Failed to start conversation');
+      });
     } catch (error: any) {
       console.error('Error during submission process:', error);
       if (error instanceof ProjectLimitError) {
@@ -392,6 +470,14 @@ export function DashboardContent() {
   }, []);
 
   React.useEffect(() => {
+    const dummyProjectId = 'prefetch-project';
+    const dummyThreadId = 'prefetch-thread';
+    const routeToPrefetch = `/projects/${dummyProjectId}/thread/${dummyThreadId}`;
+    router.prefetch(routeToPrefetch);
+    prefetchedRouteRef.current = routeToPrefetch;
+  }, [router]);
+
+  React.useEffect(() => {
     if (autoSubmit && inputValue && !isSubmitting && !isRedirecting) {
       const timer = setTimeout(() => {
         handleSubmit(inputValue);
@@ -402,6 +488,31 @@ export function DashboardContent() {
     }
     return undefined;
   }, [autoSubmit, inputValue, isSubmitting, isRedirecting, handleSubmit]);
+
+  React.useEffect(() => {
+    if (inputValue.trim() && !isSubmitting && !isRedirecting) {
+      if (prefetchTimeoutRef.current) {
+        clearTimeout(prefetchTimeoutRef.current);
+      }
+
+      prefetchTimeoutRef.current = setTimeout(() => {
+        const dummyProjectId = 'prefetch-project';
+        const dummyThreadId = 'prefetch-thread';
+        const routeToPrefetch = `/projects/${dummyProjectId}/thread/${dummyThreadId}`;
+        
+        if (prefetchedRouteRef.current !== routeToPrefetch) {
+          router.prefetch(routeToPrefetch);
+          prefetchedRouteRef.current = routeToPrefetch;
+        }
+      }, 300);
+    }
+
+    return () => {
+      if (prefetchTimeoutRef.current) {
+        clearTimeout(prefetchTimeoutRef.current);
+      }
+    };
+  }, [inputValue, isSubmitting, isRedirecting, router]);
 
   return (
     <>
@@ -416,6 +527,13 @@ export function DashboardContent() {
             <CreditsDisplay />
           </Suspense>
           <UsageLimitsPopover />
+          <a
+            href="mailto:support@kortix.com"
+            className="flex items-center justify-center h-[41px] w-[41px] border-[1.5px] border-border/60 dark:border-border rounded-full bg-background dark:bg-background hover:bg-accent/30 dark:hover:bg-accent/20 hover:border-border dark:hover:border-border/80 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            title="Contact Support"
+          >
+            <HelpCircle className="h-5 w-5 text-muted-foreground dark:text-muted-foreground/60" />
+          </a>
         </div>
 
         <div className="flex-1 overflow-y-auto">
@@ -437,7 +555,7 @@ export function DashboardContent() {
                         : "text-muted-foreground hover:text-foreground"
                     )}
                   >
-                    Kortix Super Worker
+                    Kortix
                   </button>
                   <button
                     onClick={() => {
@@ -461,18 +579,14 @@ export function DashboardContent() {
 
             <div className="flex-1 flex items-start justify-center pt-[25vh] sm:pt-[30vh]">
               {viewMode === 'super-worker' && (
-                <div className="w-full animate-in fade-in-0 duration-300">
+                <div className="w-full">
                   <div className="px-4 py-6 sm:py-8">
                     <div className="w-full max-w-3xl mx-auto flex flex-col items-center space-y-5 sm:space-y-6 md:space-y-8">
-                      <div className="flex flex-col items-center text-center w-full">
-                        <p
-                          className="tracking-tight text-2xl sm:text-2xl md:text-3xl font-normal text-foreground/90"
-                        >
-                          {t('whatWouldYouLike')}
-                        </p>
+                      <div className="flex flex-col items-center text-center w-full animate-in fade-in-0 slide-in-from-bottom-4 duration-500 fill-mode-both">
+                        <DynamicGreeting className="text-2xl sm:text-2xl md:text-3xl font-normal text-foreground/90" />
                       </div>
 
-                      <div className="w-full flex flex-col items-center">
+                      <div className="w-full flex flex-col items-center animate-in fade-in-0 slide-in-from-bottom-4 duration-500 delay-100 fill-mode-both">
                         <ChatInput
                           ref={chatInputRef}
                           onSubmit={handleSubmit}
@@ -494,6 +608,8 @@ export function DashboardContent() {
                           selectedCharts={selectedCharts}
                           selectedOutputFormat={selectedOutputFormat}
                           selectedTemplate={selectedTemplate}
+                          memoryEnabled={memoryEnabled}
+                          onMemoryToggle={setMemoryEnabled}
                         />
 
                         {alertType === 'daily_refresh' && (
@@ -521,27 +637,17 @@ export function DashboardContent() {
 
                         {alertType === 'thread_limit' && (
                           <div 
-                            className='w-full h-16 p-2 px-4 dark:bg-amber-500/5 bg-amber-500/10 dark:border-amber-500/10 border-amber-700/10 border text-white rounded-b-3xl flex items-center justify-between overflow-hidden'
+                            className='w-full h-16 p-2 px-4 dark:bg-amber-500/5 bg-amber-500/10 dark:border-amber-500/10 border-amber-700/10 border text-white rounded-b-3xl flex items-center justify-center overflow-hidden cursor-pointer hover:bg-amber-500/15 transition-colors'
                             style={{
                               marginTop: '-40px',
                               transition: 'margin-top 300ms ease-in-out, opacity 300ms ease-in-out',
                             }}
+                            onClick={() => pricingModalStore.openPricingModal()}
                           >
-                            <span className='-mb-3.5 dark:text-amber-500 text-amber-700 text-sm'>
-                              {t('limitsExceeded', { 
-                                current: accountState?.limits?.threads?.current ?? 0, 
-                                limit: accountState?.limits?.threads?.max ?? 0 
-                              })}
+                            <span className='-mb-3.5 dark:text-amber-500 text-amber-700 text-sm flex items-center gap-1'>
+                              {t('limitsExceeded')}
+                              <ChevronRight className='h-4 w-4' />
                             </span>
-                            <div className='flex items-center -mb-3.5'>
-                              <Button 
-                                size='sm' 
-                                className='h-6 text-xs'
-                                onClick={() => pricingModalStore.openPricingModal()}
-                              >
-                                {tCommon('upgrade')}
-                              </Button>
-                            </div>
                           </div>
                         )}
                       </div>
@@ -550,7 +656,7 @@ export function DashboardContent() {
 
                   {/* Modes Panel - Below chat input, doesn't affect its position */}
                   {isSunaAgent && (
-                    <div className="px-4 pb-6 sm:pb-8">
+                    <div className="px-4 pb-6 sm:pb-8 animate-in fade-in-0 slide-in-from-bottom-4 duration-500 delay-200 fill-mode-both">
                       <div className="max-w-3xl mx-auto">
                         <Suspense fallback={<div className="h-24 bg-muted/10 rounded-lg animate-pulse" />}>
                           <SunaModesPanel

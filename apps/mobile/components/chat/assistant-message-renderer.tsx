@@ -15,8 +15,8 @@ import type { UnifiedMessage, ParsedMetadata, ParsedContent } from '@/api/types'
 import { safeJsonParse } from '@/lib/utils/message-grouping';
 import { getToolIcon, getUserFriendlyToolName } from '@/lib/utils/tool-display';
 import { isAskOrCompleteTool, extractTextFromArguments } from '@/lib/utils/streaming-utils';
-import Markdown from 'react-native-markdown-display';
-import { markdownStyles, markdownStylesDark, selectableRenderRules } from '@/lib/utils/markdown-styles';
+import { SelectableMarkdownText } from '@/components/ui/selectable-markdown';
+import { autoLinkUrls } from '@/lib/utils/url-autolink';
 import { Linking } from 'react-native';
 import { FileAttachmentsGrid } from './FileAttachmentRenderer';
 import { TaskCompletedFeedback } from './tool-views/complete-tool/TaskCompletedFeedback';
@@ -28,6 +28,8 @@ export interface AssistantMessageRendererProps {
   onToolClick: (assistantMessageId: string | null, toolName: string) => void;
   onFileClick?: (filePath: string) => void;
   sandboxId?: string;
+  /** Sandbox URL for direct file access (used for presentations and HTML previews) */
+  sandboxUrl?: string;
   isLatestMessage?: boolean;
   threadId?: string;
   onPromptFill?: (message: string) => void;
@@ -101,7 +103,7 @@ function renderAskToolCall(
   index: number,
   props: AssistantMessageRendererProps
 ): React.ReactNode {
-  const { onFileClick, sandboxId, isLatestMessage, onPromptFill, isDark = false } = props;
+  const { onFileClick, sandboxId, sandboxUrl, isLatestMessage, onPromptFill, isDark = false } = props;
 
   let args: Record<string, any> = {};
   if (toolCall.arguments) {
@@ -123,17 +125,15 @@ function renderAskToolCall(
   return (
     <View key={`ask-${index}`} className="gap-3">
       {askText && (
-        <Markdown
-          style={isDark ? markdownStylesDark : markdownStyles}
-          rules={selectableRenderRules}
-        >
-          {askText.replace(/<((https?:\/\/|mailto:)[^>\s]+)>/g, (_: string, url: string) => `[${url}](${url})`)}
-        </Markdown>
+        <SelectableMarkdownText isDark={isDark}>
+          {autoLinkUrls(askText).replace(/<((https?:\/\/|mailto:)[^>\s]+)>/g, (_: string, url: string) => `[${url}](${url})`)}
+        </SelectableMarkdownText>
       )}
       {attachments.length > 0 && (
         <FileAttachmentsGrid
           filePaths={attachments}
           sandboxId={sandboxId}
+          sandboxUrl={sandboxUrl}
           compact={false}
           showPreviews={true}
           onFilePress={onFileClick}
@@ -169,7 +169,7 @@ function renderCompleteToolCall(
   index: number,
   props: AssistantMessageRendererProps
 ): React.ReactNode {
-  const { onFileClick, sandboxId, isLatestMessage, threadId, message, onPromptFill, isDark = false } = props;
+  const { onFileClick, sandboxId, sandboxUrl, isLatestMessage, threadId, message, onPromptFill, isDark = false } = props;
 
   let args: Record<string, any> = {};
   if (toolCall.arguments) {
@@ -191,17 +191,15 @@ function renderCompleteToolCall(
   return (
     <View key={`complete-${index}`} className="gap-3">
       {completeText && (
-        <Markdown
-          style={isDark ? markdownStylesDark : markdownStyles}
-          rules={selectableRenderRules}
-        >
-          {completeText.replace(/<((https?:\/\/|mailto:)[^>\s]+)>/g, (_: string, url: string) => `[${url}](${url})`)}
-        </Markdown>
+        <SelectableMarkdownText isDark={isDark}>
+          {autoLinkUrls(completeText).replace(/<((https?:\/\/|mailto:)[^>\s]+)>/g, (_: string, url: string) => `[${url}](${url})`)}
+        </SelectableMarkdownText>
       )}
       {attachments.length > 0 && (
         <FileAttachmentsGrid
           filePaths={attachments}
           sandboxId={sandboxId}
+          sandboxUrl={sandboxUrl}
           compact={false}
           showPreviews={true}
           onFilePress={onFileClick}
@@ -318,13 +316,9 @@ export function renderAssistantMessage(props: AssistantMessageRendererProps): Re
   // Render text content first (if any)
   if (textContent.trim()) {
     contentParts.push(
-      <Markdown
-        key="text-content"
-        style={isDark ? markdownStylesDark : markdownStyles}
-        rules={selectableRenderRules}
-      >
-        {textContent.replace(/<((https?:\/\/|mailto:)[^>\s]+)>/g, (_: string, url: string) => `[${url}](${url})`)}
-      </Markdown>
+      <SelectableMarkdownText key="text-content" isDark={isDark}>
+        {autoLinkUrls(textContent).replace(/<((https?:\/\/|mailto:)[^>\s]+)>/g, (_: string, url: string) => `[${url}](${url})`)}
+      </SelectableMarkdownText>
     );
   }
 

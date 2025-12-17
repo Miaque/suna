@@ -37,6 +37,7 @@ from core.setup import router as setup_router, webhook_router
 from core.admin.admin_api import router as admin_router
 from core.admin.billing_admin_api import router as billing_admin_router
 from core.admin.notification_admin_api import router as notification_admin_router
+from core.admin.analytics_admin_api import router as analytics_admin_router
 from core.services import transcription as transcription_api
 import sys
 from core.triggers import api as triggers_api
@@ -59,11 +60,12 @@ MAX_CONCURRENT_IPS = 25
 
 # Background task handle for CloudWatch metrics
 _queue_metrics_task = None
+_worker_metrics_task = None
 _memory_watchdog_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _queue_metrics_task, _memory_watchdog_task
+    global _queue_metrics_task, _worker_metrics_task, _memory_watchdog_task
     env_mode = config.ENV_MODE.value if config.ENV_MODE else "unknown"
     logger.debug(f"Starting up FastAPI application with instance ID: {instance_id} in {env_mode} mode")
     try:
@@ -106,6 +108,10 @@ async def lifespan(app: FastAPI):
         if config.ENV_MODE == EnvMode.PRODUCTION:
             from core.services import queue_metrics
             _queue_metrics_task = asyncio.create_task(queue_metrics.start_cloudwatch_publisher())
+            
+            # Start CloudWatch worker metrics publisher
+            from core.services import worker_metrics
+            _worker_metrics_task = asyncio.create_task(worker_metrics.start_cloudwatch_publisher())
         
         # Start memory watchdog for observability
         _memory_watchdog_task = asyncio.create_task(_memory_watchdog())
@@ -120,6 +126,14 @@ async def lifespan(app: FastAPI):
             _queue_metrics_task.cancel()
             try:
                 await _queue_metrics_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop CloudWatch worker metrics task
+        if _worker_metrics_task is not None:
+            _worker_metrics_task.cancel()
+            try:
+                await _worker_metrics_task
             except asyncio.CancelledError:
                 pass
         
@@ -247,7 +261,7 @@ app.add_middleware(
     allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Project-Id", "X-MCP-URL", "X-MCP-Type", "X-MCP-Headers", "X-Refresh-Token", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization", "X-Project-Id", "X-MCP-URL", "X-MCP-Type", "X-MCP-Headers", "X-API-Key"],
 )
 
 # Create a main API router
@@ -263,6 +277,7 @@ api_router.include_router(api_keys_api.router)
 api_router.include_router(billing_admin_router)
 api_router.include_router(admin_router)
 api_router.include_router(notification_admin_router)
+api_router.include_router(analytics_admin_router)
 
 from core.mcp_module import api as mcp_api
 from core.credentials import api as credentials_api
@@ -296,7 +311,9 @@ from core.google.google_docs_api import router as google_docs_router
 api_router.include_router(google_docs_router)
 
 from core.referrals import router as referrals_router
+from core.memory.api import router as memory_router
 api_router.include_router(referrals_router)
+api_router.include_router(memory_router)
 
 @api_router.get("/health", summary="Health Check", operation_id="health_check", tags=["system"])
 async def health_check():
@@ -316,6 +333,33 @@ async def queue_metrics_endpoint():
     except Exception as e:
         logger.error(f"Failed to get queue metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to get queue metrics")
+
+@api_router.get("/metrics/workers", summary="Worker Metrics", operation_id="worker_metrics", tags=["system"])
+async def worker_metrics_endpoint():
+    """Get active Dramatiq worker count and thread utilization for monitoring."""
+    from core.services import worker_metrics
+    try:
+        return await worker_metrics.get_worker_metrics()
+    except Exception as e:
+        logger.error(f"Failed to get worker metrics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get worker metrics")
+
+@api_router.get("/metrics", summary="All Metrics", operation_id="all_metrics", tags=["system"])
+async def all_metrics_endpoint():
+    """Get combined queue and worker metrics for monitoring."""
+    from core.services import queue_metrics, worker_metrics
+    try:
+        queue_data = await queue_metrics.get_queue_metrics()
+        worker_data = await worker_metrics.get_worker_metrics()
+        
+        return {
+            "queue": queue_data,
+            "workers": worker_data,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Failed to get metrics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get metrics")
 
 @api_router.get("/health-docker", summary="Docker Health Check", operation_id="health_check_docker", tags=["system"])
 async def health_check_docker():
@@ -384,5 +428,6 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=8000,
         workers=workers,
-        loop="asyncio"
+        loop="asyncio",
+        reload=True if is_dev_env else False
     )

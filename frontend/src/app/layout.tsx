@@ -19,6 +19,7 @@ const SpeedInsights = lazy(() => import('@vercel/speed-insights/next').then(mod 
 const GoogleAnalytics = lazy(() => import('@next/third-parties/google').then(mod => ({ default: mod.GoogleAnalytics })));
 const PostHogIdentify = lazy(() => import('@/components/posthog-identify').then(mod => ({ default: mod.PostHogIdentify })));
 const PlanSelectionModal = lazy(() => import('@/components/billing/pricing/plan-selection-modal').then(mod => ({ default: mod.PlanSelectionModal })));
+const AnnouncementDialog = lazy(() => import('@/components/announcements/announcement-dialog').then(mod => ({ default: mod.AnnouncementDialog })));
 
 
 export const viewport: Viewport = {
@@ -112,6 +113,9 @@ export default function RootLayout({
         <link rel="dns-prefetch" href="https://connect.facebook.net" />
         <link rel="dns-prefetch" href="https://eu.i.posthog.com" />
         
+        {/* React Scan removed - causing initialization errors */}
+        {/* rest of your scripts go under */}
+        
         {/* Static SEO meta tags - rendered in initial HTML */}
         <title>Kortix: Your Autonomous AI Worker</title>
         <meta name="description" content="Built for complex tasks, designed for everything. The ultimate AI assistant that handles it all—from simple requests to mega-complex projects." />
@@ -161,7 +165,7 @@ export default function RootLayout({
               '@context': 'https://schema.org',
               '@type': 'Organization',
               name: siteMetadata.name,
-              alternateName: ['Suna', 'Kortix AI', 'Kortix: Your Autonomous AI Worker'],
+              alternateName: ['Kortix', 'Kortix AI', 'Kortix: Your Autonomous AI Worker'],
               url: siteMetadata.url,
               logo: `${siteMetadata.url}/favicon.png`,
               description: siteMetadata.description,
@@ -187,7 +191,7 @@ export default function RootLayout({
               '@context': 'https://schema.org',
               '@type': 'SoftwareApplication',
               name: siteMetadata.title,
-              alternateName: [siteMetadata.name, 'Suna'],
+              alternateName: [siteMetadata.name, 'Kortix'],
               applicationCategory: 'BusinessApplication',
               operatingSystem: 'Web, macOS, Windows, Linux',
               description: siteMetadata.description,
@@ -249,6 +253,7 @@ export default function RootLayout({
             <Analytics />
           </Suspense>
           <Suspense fallback={null}>
+            <GoogleAnalytics gaId="G-QSCBD7F1SD" />
             <GoogleAnalytics gaId="G-6ETJFB3PT3" />
           </Suspense>
           <Suspense fallback={null}>
