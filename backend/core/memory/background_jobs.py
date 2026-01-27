@@ -1,171 +1,115 @@
-import dramatiq
+"""Memory background job functions."""
+
 import asyncio
-import os
+from datetime import datetime, timezone
 from typing import List, Dict, Any
-from datetime import datetime, timezone, timedelta
+
 from core.utils.logger import logger, structlog
 from core.services.supabase import DBConnection
-from core.billing.shared.config import get_memory_config, is_memory_enabled
-from .extraction_service import MemoryExtractionService
-from .embedding_service import EmbeddingService
-from .models import MemoryType, ExtractionQueueStatus
 
-# Get queue prefix from environment (for preview deployments)
-QUEUE_PREFIX = os.getenv("DRAMATIQ_QUEUE_PREFIX", "")
+_db = DBConnection()
 
-def get_queue_name(base_name: str) -> str:
-    """Get queue name with optional prefix for preview deployments."""
-    if QUEUE_PREFIX:
-        return f"{QUEUE_PREFIX}{base_name}"
-    return base_name
 
-db = DBConnection()
-extraction_service = MemoryExtractionService()
-embedding_service = EmbeddingService()
-
-__all__ = [
-    'extract_memories_from_conversation',
-    'embed_and_store_memories',
-    'consolidate_memories',
-]
-
-@dramatiq.actor(queue_name=get_queue_name("default"))
-async def extract_memories_from_conversation(
+async def run_memory_extraction(
     thread_id: str,
     account_id: str,
-    message_ids: List[str]
-):
+    message_ids: List[str],
+) -> None:
+    """Extract memories from messages - runs as async background task."""
+    from core.utils.config import config
+    from core.utils.init_helpers import initialize
+    
+    if not config.ENABLE_MEMORY:
+        logger.debug("Memory extraction skipped: ENABLE_MEMORY is False")
+        return
+    
     structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        thread_id=thread_id,
-        account_id=account_id,
-        job_type="memory_extraction"
-    )
+    structlog.contextvars.bind_contextvars(thread_id=thread_id, account_id=account_id)
     
-    logger.info(f"Starting memory extraction for thread {thread_id}")
+    logger.info(f"🧠 Extracting memories from thread: {thread_id}")
     
-    await db.initialize()
-    client = await db.client
+    await initialize()
     
     try:
+        from core.memory.extraction_service import MemoryExtractionService
         from core.billing import subscription_service
+        from core.billing.shared.config import is_memory_enabled
+        
+        client = await _db.client
+        
         tier_info = await subscription_service.get_user_subscription_tier(account_id)
-        tier_name = tier_info['name']
-        
-        if not is_memory_enabled(tier_name):
-            logger.debug(f"Memory disabled for tier {tier_name}, skipping extraction")
+        if not is_memory_enabled(tier_info['name']):
+            logger.debug(f"Memory disabled for tier {tier_info['name']}")
             return
-        
-        user_memory_result = await client.rpc('get_user_memory_enabled', {'p_account_id': account_id}).execute()
-        user_memory_enabled = user_memory_result.data if user_memory_result.data is not None else True
-        if not user_memory_enabled:
-            logger.debug(f"Memory disabled by user {account_id}, skipping extraction")
-            return
-        
-        recent_extraction = await client.table('memory_extraction_queue').select('created_at').eq('thread_id', thread_id).eq('status', 'completed').order('created_at', desc=True).limit(1).execute()
-        
-        if recent_extraction.data:
-            last_extraction = datetime.fromisoformat(recent_extraction.data[0]['created_at'].replace('Z', '+00:00'))
-            if datetime.now(timezone.utc) - last_extraction < timedelta(hours=1):
-                logger.debug(f"Recent extraction found for thread {thread_id}, skipping")
-                return
         
         messages_result = await client.table('messages').select('*').in_('message_id', message_ids).execute()
-        messages = messages_result.data or []
-        
-        if not await extraction_service.should_extract(messages):
-            logger.debug(f"Not enough content for extraction in thread {thread_id}")
+        if not messages_result.data:
             return
         
-        queue_entry = await client.table('memory_extraction_queue').insert({
-            'thread_id': thread_id,
-            'account_id': account_id,
-            'message_ids': message_ids,
-            'status': ExtractionQueueStatus.PROCESSING.value
-        }).execute()
+        extraction_service = MemoryExtractionService()
+        if not await extraction_service.should_extract(messages_result.data):
+            return
         
-        queue_id = queue_entry.data[0]['queue_id']
-        
-        extracted_memories = await extraction_service.extract_memories(
-            messages=messages,
+        extracted = await extraction_service.extract_memories(
+            messages=messages_result.data,
             account_id=account_id,
             thread_id=thread_id
         )
         
-        if not extracted_memories:
-            logger.info(f"No memories extracted from thread {thread_id}")
-            await client.table('memory_extraction_queue').update({
-                'status': ExtractionQueueStatus.COMPLETED.value,
-                'processed_at': datetime.now(timezone.utc).isoformat()
-            }).eq('queue_id', queue_id).execute()
-            return
+        if extracted:
+            asyncio.create_task(run_memory_embedding(
+                account_id, 
+                thread_id, 
+                [{'content': m.content, 'memory_type': m.memory_type.value, 'confidence_score': m.confidence_score, 'metadata': m.metadata} for m in extracted]
+            ))
         
-        embed_and_store_memories.send(
-            account_id=account_id,
-            thread_id=thread_id,
-            extracted_memories=[
-                {
-                    'content': mem.content,
-                    'memory_type': mem.memory_type.value,
-                    'confidence_score': mem.confidence_score,
-                    'metadata': mem.metadata
-                }
-                for mem in extracted_memories
-            ]
-        )
+        logger.info(f"✅ Extracted {len(extracted) if extracted else 0} memories")
         
-        await client.table('memory_extraction_queue').update({
-            'status': ExtractionQueueStatus.COMPLETED.value,
-            'processed_at': datetime.now(timezone.utc).isoformat()
-        }).eq('queue_id', queue_id).execute()
-        
-        logger.info(f"Successfully extracted {len(extracted_memories)} memories from thread {thread_id}")
-    
     except Exception as e:
-        logger.error(f"Memory extraction failed for thread {thread_id}: {str(e)}")
-        try:
-            await client.table('memory_extraction_queue').update({
-                'status': ExtractionQueueStatus.FAILED.value,
-                'error_message': str(e),
-                'processed_at': datetime.now(timezone.utc).isoformat()
-            }).eq('thread_id', thread_id).eq('status', ExtractionQueueStatus.PROCESSING.value).execute()
-        except:
-            pass
+        logger.error(f"Memory extraction failed: {e}", exc_info=True)
 
-@dramatiq.actor(queue_name=get_queue_name("default"))
-async def embed_and_store_memories(
+
+async def run_memory_embedding(
     account_id: str,
     thread_id: str,
-    extracted_memories: List[Dict[str, Any]]
-):
+    extracted_memories: List[Dict[str, Any]],
+) -> None:
+    """Embed and store memories - runs as async background task."""
+    from core.utils.config import config
+    from core.utils.init_helpers import initialize
+    
+    if not config.ENABLE_MEMORY:
+        logger.debug("Memory embedding skipped: ENABLE_MEMORY is False")
+        return
+    
     structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        thread_id=thread_id,
-        account_id=account_id,
-        job_type="memory_embedding"
-    )
+    structlog.contextvars.bind_contextvars(account_id=account_id)
     
-    logger.info(f"Starting embedding and storage for {len(extracted_memories)} memories")
+    logger.info(f"💾 Embedding {len(extracted_memories)} memories")
     
-    await db.initialize()
-    client = await db.client
+    await initialize()
     
     try:
+        from core.memory.embedding_service import EmbeddingService
         from core.billing import subscription_service
+        from core.billing.shared.config import get_memory_config
+        
+        client = await _db.client
+        embedding_service = EmbeddingService()
+        
         tier_info = await subscription_service.get_user_subscription_tier(account_id)
-        tier_name = tier_info['name']
-        memory_config = get_memory_config(tier_name)
+        memory_config = get_memory_config(tier_info['name'])
         max_memories = memory_config.get('max_memories', 0)
         
         current_count_result = await client.table('user_memories').select('memory_id', count='exact').eq('account_id', account_id).execute()
         current_count = current_count_result.count or 0
         
-        texts_to_embed = [mem['content'] for mem in extracted_memories]
-        embeddings = await embedding_service.embed_texts(texts_to_embed)
+        texts = [m['content'] for m in extracted_memories]
+        embeddings = await embedding_service.embed_texts(texts)
         
-        memories_to_insert = []
+        to_insert = []
         for i, mem in enumerate(extracted_memories):
-            memories_to_insert.append({
+            to_insert.append({
                 'account_id': account_id,
                 'content': mem['content'],
                 'memory_type': mem['memory_type'],
@@ -175,72 +119,73 @@ async def embed_and_store_memories(
                 'metadata': mem.get('metadata', {})
             })
         
-        if current_count + len(memories_to_insert) > max_memories:
-            overflow = (current_count + len(memories_to_insert)) - max_memories
-            
-            old_memories = await client.table('user_memories').select('memory_id').eq('account_id', account_id).order('confidence_score', desc=False).order('created_at', desc=False).limit(overflow).execute()
-            
-            if old_memories.data:
-                memory_ids_to_delete = [m['memory_id'] for m in old_memories.data]
-                await client.table('user_memories').delete().in_('memory_id', memory_ids_to_delete).execute()
-                logger.info(f"Deleted {len(memory_ids_to_delete)} old memories to stay within limit")
+        if current_count + len(to_insert) > max_memories:
+            overflow = (current_count + len(to_insert)) - max_memories
+            old = await client.table('user_memories').select('memory_id').eq('account_id', account_id).order('confidence_score', desc=False).limit(overflow).execute()
+            if old.data:
+                ids_to_delete = [m['memory_id'] for m in old.data]
+                await client.table('user_memories').delete().in_('memory_id', ids_to_delete).execute()
         
-        result = await client.table('user_memories').insert(memories_to_insert).execute()
+        await client.table('user_memories').insert(to_insert).execute()
+        logger.info(f"✅ Stored {len(to_insert)} memories")
         
-        logger.info(f"Successfully stored {len(result.data)} memories for account {account_id}")
-    
     except Exception as e:
-        logger.error(f"Memory embedding and storage failed: {str(e)}")
+        logger.error(f"Memory embedding failed: {e}", exc_info=True)
 
-@dramatiq.actor(queue_name=get_queue_name("default"))
-async def consolidate_memories(account_id: str):
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        account_id=account_id,
-        job_type="memory_consolidation"
-    )
+
+def start_memory_extraction(thread_id: str, account_id: str, message_ids: List[str]) -> None:
+    """Start memory extraction as background task."""
+    asyncio.create_task(run_memory_extraction(thread_id, account_id, message_ids))
+    logger.debug(f"Started memory extraction for thread {thread_id}")
+
+
+def start_memory_embedding(account_id: str, thread_id: str, extracted_memories: List[Dict[str, Any]]) -> None:
+    """Start memory embedding as background task."""
+    asyncio.create_task(run_memory_embedding(account_id, thread_id, extracted_memories))
+    logger.debug(f"Started memory embedding for thread {thread_id}")
+
+
+async def extract_memories(thread_id: str, account_id: str, message_ids: List[str]):
+    """Start memory extraction task."""
+    from core.utils.config import config
+    if not config.ENABLE_MEMORY:
+        return
+    start_memory_extraction(thread_id, account_id, message_ids)
+
+
+async def embed_memories(account_id: str, thread_id: str, memories: List[Dict[str, Any]]):
+    """Start memory embedding task."""
+    from core.utils.config import config
+    if not config.ENABLE_MEMORY:
+        return
+    start_memory_embedding(account_id, thread_id, memories)
+
+
+# Backwards-compatible wrappers with .send() interface
+class _DispatchWrapper:
+    def __init__(self, dispatch_fn):
+        self._dispatch_fn = dispatch_fn
     
-    logger.info(f"Starting memory consolidation for account {account_id}")
-    
-    await db.initialize()
-    client = await db.client
-    
-    try:
-        memories_result = await client.table('user_memories').select('*').eq('account_id', account_id).order('created_at', desc=True).limit(500).execute()
-        
-        memories = memories_result.data or []
-        
-        if len(memories) < 10:
-            logger.debug(f"Not enough memories to consolidate for {account_id}")
-            return
-        
-        similarity_threshold = 0.95
-        consolidated_count = 0
-        
-        for i, mem1 in enumerate(memories):
-            if not mem1.get('embedding'):
-                continue
-            
-            for mem2 in memories[i+1:]:
-                if not mem2.get('embedding'):
-                    continue
-                
-                import numpy as np
-                embedding1 = np.array(mem1['embedding'])
-                embedding2 = np.array(mem2['embedding'])
-                
-                similarity = np.dot(embedding1, embedding2) / (np.linalg.norm(embedding1) * np.linalg.norm(embedding2))
-                
-                if similarity >= similarity_threshold:
-                    if mem1.get('confidence_score', 0) >= mem2.get('confidence_score', 0):
-                        await client.table('user_memories').delete().eq('memory_id', mem2['memory_id']).execute()
-                    else:
-                        await client.table('user_memories').delete().eq('memory_id', mem1['memory_id']).execute()
-                        break
-                    
-                    consolidated_count += 1
-        
-        logger.info(f"Consolidated {consolidated_count} duplicate memories for account {account_id}")
-    
-    except Exception as e:
-        logger.error(f"Memory consolidation failed for {account_id}: {str(e)}")
+    def send(self, **kwargs):
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(self._dispatch_fn(**kwargs))
+        except RuntimeError:
+            asyncio.run(self._dispatch_fn(**kwargs))
+
+
+async def _extract_memories_wrapper(thread_id: str, account_id: str, message_ids: List[str]):
+    """Wrapper that checks ENABLE_MEMORY before dispatching."""
+    from core.utils.config import config
+    if config.ENABLE_MEMORY:
+        await extract_memories(thread_id, account_id, message_ids)
+
+async def _embed_memories_wrapper(account_id: str, thread_id: str, extracted_memories: List[Dict[str, Any]]):
+    """Wrapper that checks ENABLE_MEMORY before dispatching."""
+    from core.utils.config import config
+    if config.ENABLE_MEMORY:
+        await embed_memories(account_id, thread_id, extracted_memories)
+
+extract_memories_from_conversation = _DispatchWrapper(_extract_memories_wrapper)
+embed_and_store_memories = _DispatchWrapper(_embed_memories_wrapper)

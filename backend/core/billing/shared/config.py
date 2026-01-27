@@ -17,9 +17,6 @@ CREDITS_PER_DOLLAR = 100
 
 FREE_TIER_INITIAL_CREDITS = Decimal('0.00')
 
-# "Unlimited" plan limits
-# We keep these as large integers (instead of None/inf) to avoid touching downstream
-# DB queries, JSON serialization, and comparison logic across the codebase.
 UNLIMITED_THREAD_LIMIT = 100_000
 UNLIMITED_PROJECT_LIMIT = UNLIMITED_THREAD_LIMIT * 2
 
@@ -40,6 +37,7 @@ class Tier:
     memory_config: Optional[Dict] = None
     daily_credit_config: Optional[Dict] = None
     monthly_refill_enabled: Optional[bool] = True
+    disabled_tools: Optional[List[str]] = None  # Tools disabled for this tier
 
 TIERS: Dict[str, Tier] = {
     'none': Tier(
@@ -68,8 +66,8 @@ TIERS: Dict[str, Tier] = {
         display_name='Basic',
         can_purchase_credits=False,
         models=['haiku'],
-        project_limit=20,  # 2x thread_limit (safety buffer for orphan projects)
-        thread_limit=10,
+        project_limit=2,  # 2x thread_limit (safety buffer for orphan projects)
+        thread_limit=1,
         concurrent_runs=1,
         custom_workers_limit=0,
         scheduled_triggers_limit=0,
@@ -81,10 +79,15 @@ TIERS: Dict[str, Tier] = {
         },
         daily_credit_config={
             'enabled': True,
-            'amount': Decimal('1.00'),
-            'refresh_interval_hours': 24
+            'amount': Decimal('3.00'),
+            'refresh_interval_hours': 168
         },
-        monthly_refill_enabled=False
+        monthly_refill_enabled=False,
+        disabled_tools=[
+            'sb_presentation_tool',  # Slides/presentations
+            'sb_canvas_tool',        # Canvas designs
+            'sb_spreadsheet_tool',   # Spreadsheets
+        ]
     ),
     'tier_2_20': Tier(
         name='tier_2_20',
@@ -464,3 +467,8 @@ def get_max_memories(tier_name: str) -> int:
 def get_memory_retrieval_limit(tier_name: str) -> int:
     config = get_memory_config(tier_name)
     return config.get('retrieval_limit', 0)
+
+def get_tier_disabled_tools(tier_name: str) -> List[str]:
+    """Get list of tools disabled for a specific tier."""
+    tier = TIERS.get(tier_name, TIERS['free'])
+    return tier.disabled_tools or []

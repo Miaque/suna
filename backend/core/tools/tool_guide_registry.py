@@ -67,11 +67,10 @@ class ToolGuideRegistry:
             "**Batch load ALL tools you need upfront:**",
             "- Analyze user request → Identify all needed tools → Load in ONE call",
             "- Example: initialize tools like web_search_tool, browser_tool, sb_files_tool together",
-            "- This is INTERNAL (invisible to users) - don't mention it",
             "",
             "**🚨 CRITICAL - Tool Guides Give You Function Names:**",
             "Each tool provides SPECIFIC FUNCTIONS. Loading the guide reveals what you can use:",
-            "- sb_presentation_tool → create_slide, load_template_design, validate_slide",
+            "- sb_presentation_tool → create_slide, load_template_design",
             "- sb_files_tool → create_file, edit_file, full_file_rewrite",
             "- sb_file_reader_tool → read_file - read PDFs, documents, text files, CSV, JSON, code",
             "- browser_tool → browser_navigate, browser_click, browser_screenshot",
@@ -198,3 +197,26 @@ def get_tool_guide(tool_name: str) -> Optional[str]:
 
 def get_minimal_tool_index() -> str:
     return get_tool_guide_registry().get_minimal_index()
+
+
+def get_minimal_tool_index_filtered(disabled_tools: List[str]) -> str:
+    """Get minimal tool index with disabled tools filtered out."""
+    if not disabled_tools:
+        return get_minimal_tool_index()
+
+    index = get_minimal_tool_index()
+
+    # Filter out lines that mention disabled tools
+    lines = index.split('\n')
+    filtered_lines = []
+    for line in lines:
+        # Check if any disabled tool is mentioned in this line
+        should_skip = False
+        for tool in disabled_tools:
+            if tool in line:
+                should_skip = True
+                break
+        if not should_skip:
+            filtered_lines.append(line)
+
+    return '\n'.join(filtered_lines)

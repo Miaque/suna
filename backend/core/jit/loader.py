@@ -27,6 +27,7 @@ class JITLoader:
             'sb_shell_tool',
             'sb_files_tool',
             'sb_file_reader_tool',
+            'sb_spreadsheet_tool',
             'web_search_tool',
             'image_search_tool',
             'sb_vision_tool',
@@ -86,6 +87,8 @@ class JITLoader:
             
             logger.info(f"⚡ [JIT] Activating '{tool_name}' with params: {list(kwargs.keys())}")
             thread_manager.add_tool(tool_class, **kwargs)
+            
+            thread_manager.tool_registry.invalidate_function_cache()
             
             elapsed_ms = (time.time() - start_time) * 1000
             logger.info(f"✅ [JIT] Tool '{tool_name}' activated successfully in {elapsed_ms:.1f}ms")

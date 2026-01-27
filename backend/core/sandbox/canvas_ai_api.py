@@ -6,7 +6,7 @@ Supports multiple models: GPT Image (via Replicate), Gemini (via OpenRouter), an
 
 import os
 import base64
-import httpx
+import asyncio
 import replicate
 from io import BytesIO
 from typing import Optional, Literal
@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from core.utils.logger import logger
 from core.utils.auth_utils import verify_and_get_user_id_from_jwt
 from core.utils.config import get_config
+from core.services.http_client import get_http_client
 from core.billing.credits.media_integration import media_billing
 
 router = APIRouter(prefix="/canvas-ai", tags=["Canvas AI"])
@@ -145,7 +146,9 @@ async def process_with_replicate_gpt(image_bytes: bytes, mime_type: str, prompt:
     logger.info(f"Calling Replicate openai/gpt-image-1.5 for editing with quality: low (image size: {len(image_bytes)} bytes)")
     
     try:
-        output = replicate.run(
+        # Wrap replicate.run() in thread pool to avoid blocking event loop
+        output = await asyncio.to_thread(
+            replicate.run,
             "openai/gpt-image-1.5",
             input={
                 "prompt": prompt,
@@ -215,11 +218,12 @@ async def process_with_gemini(
         "app": "Kortix.com"
     }
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with get_http_client() as client:
         response = await client.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
             headers=headers,
-            json=payload
+            json=payload,
+            timeout=120.0
         )
         
         if response.status_code != 200:
@@ -292,7 +296,9 @@ async def process_with_replicate_remove_bg(image_bytes: bytes, mime_type: str) -
     logger.info("Calling Replicate 851-labs/background-remover")
     
     try:
-        output = replicate.run(
+        # Wrap replicate.run() in thread pool to avoid blocking event loop
+        output = await asyncio.to_thread(
+            replicate.run,
             "851-labs/background-remover:a029dff38972b5fda4ec5d75d7d1cd25aeff621d2cf4946a41055d7db66b80bc",
             input={"image": image_data_url}
         )
@@ -313,7 +319,9 @@ async def process_with_replicate_upscale(image_bytes: bytes, mime_type: str) -> 
     logger.info("Calling Replicate recraft-ai/recraft-crisp-upscale")
     
     try:
-        output = replicate.run(
+        # Wrap replicate.run() in thread pool to avoid blocking event loop
+        output = await asyncio.to_thread(
+            replicate.run,
             "recraft-ai/recraft-crisp-upscale",
             input={"image": image_data_url}
         )
@@ -450,9 +458,9 @@ async def merge_images(
 ):
     """
     Merge multiple images with AI based on a prompt.
-    Uses GPT Image for best multi-image understanding.
+    Uses GPT Image 1.5 via Replicate for best multi-image merging.
     """
-    logger.info(f"Canvas AI: Merging {len(request.images)} images for user {user_id}")
+    logger.info(f"Canvas AI: Merging {len(request.images)} images with GPT Image 1.5 for user {user_id}")
     
     # BILLING: Check if user has credits before proceeding
     has_credits, credit_msg, balance = await media_billing.check_credits(user_id)
@@ -476,12 +484,11 @@ async def merge_images(
                 error="Merge prompt is required"
             )
         
-        # Limit to 4 images max
+        # Limit to 4 images max (GPT Image 1.5 limit)
         images_to_merge = request.images[:4]
         
-        # For Gemini, we can send multiple images in the content
-        # Build a multi-image prompt
-        image_parts = []
+        # Build data URLs for GPT Image 1.5 input_images array
+        input_images = []
         for i, img_b64 in enumerate(images_to_merge):
             try:
                 mime_type, _, clean_b64 = extract_image_data(img_b64)
@@ -489,101 +496,65 @@ async def merge_images(
                     image_data_url = img_b64
                 else:
                     image_data_url = f"data:{mime_type};base64,{clean_b64}"
-                
-                image_parts.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_data_url
-                    }
-                })
+                input_images.append(image_data_url)
             except Exception as e:
                 logger.error(f"Failed to process image {i}: {e}")
                 continue
         
-        if len(image_parts) < 2:
+        if len(input_images) < 2:
             return ImageMergeResponse(
                 success=False,
                 error="Could not process images for merging"
             )
         
-        # Use Gemini Pro for multi-image merging
-        model = MODELS["gemini-pro"]
-        
-        merge_prompt = f"""Merge these {len(image_parts)} images together. 
+        # Build merge prompt
+        merge_prompt = f"""Merge these {len(input_images)} images together.
 Instructions: {request.prompt}
 
 Create a single cohesive image that combines these images according to the instructions.
 The result should be a high-quality merged image."""
 
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://kortix.ai",
-            "X-Title": "Kortix Canvas AI"
-        }
+        _get_replicate_token()
         
-        # Build content with text first, then all images
-        content = [{"type": "text", "text": merge_prompt}] + image_parts
+        logger.info(f"Calling Replicate openai/gpt-image-1.5 for merge with {len(input_images)} images")
         
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content
+        try:
+            # Wrap replicate.run() in thread pool to avoid blocking event loop
+            output = await asyncio.to_thread(
+                replicate.run,
+                "openai/gpt-image-1.5",
+                input={
+                    "prompt": merge_prompt,
+                    "input_images": input_images,
+                    "aspect_ratio": "1:1",
+                    "number_of_images": 1,
+                    "quality": "low",  # Cost-efficient ($0.02/image)
                 }
-            ],
-            "modalities": ["image", "text"],
-            "app": "Kortix.com"
-        }
-        
-        async with httpx.AsyncClient(timeout=180.0) as client:  # Longer timeout for merge
-            response = await client.post(
-                f"{OPENROUTER_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload
             )
             
-            if response.status_code != 200:
-                error_text = response.text
-                logger.error(f"OpenRouter merge error: {response.status_code} - {error_text}")
-                raise Exception(f"Merge failed: {error_text[:200]}")
+            # Output is a list of FileOutput objects - get the first one
+            output_list = list(output) if hasattr(output, '__iter__') and not hasattr(output, 'read') else [output]
+            if len(output_list) == 0:
+                raise Exception("No output from GPT image model")
             
-            result = response.json()
+            merged_image = _replicate_output_to_base64(output_list[0], "png")
             
-            # Extract generated image
-            merged_image = None
-            if result.get("choices"):
-                message = result["choices"][0].get("message", {})
-                
-                if message.get("images"):
-                    merged_image = message["images"][0]["image_url"]["url"]
-                
-                if not merged_image:
-                    content = message.get("content", [])
-                    if isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "image_url":
-                                merged_image = part["image_url"]["url"]
-                                break
-                    
-                    if not merged_image and isinstance(content, str) and content.startswith("data:image"):
-                        merged_image = content
-            
-            if merged_image:
-                # BILLING: Deduct credits for successful merge
-                await media_billing.deduct_openrouter_image(
-                    account_id=user_id,
-                    model=MODELS["gemini-pro"],
-                    count=1,
-                    description="Canvas image merge",
-                )
-                return ImageMergeResponse(success=True, image=merged_image)
-            
-            return ImageMergeResponse(
-                success=False,
-                error="No merged image in response. The AI may not support this merge operation."
+            # BILLING: Deduct credits for successful merge
+            await media_billing.deduct_media_credits(
+                account_id=user_id,
+                provider="replicate",
+                model="openai/gpt-image-1.5",
+                media_type="image",
+                count=1,
+                description="Canvas image merge",
+                variant="low",
             )
+            
+            return ImageMergeResponse(success=True, image=merged_image)
+            
+        except Exception as e:
+            logger.error(f"GPT Image merge failed: {e}")
+            raise Exception(f"Merge failed: {str(e)}")
         
     except Exception as e:
         error_msg = str(e)
@@ -631,7 +602,9 @@ async def generate_images(
         logger.info(f"Generating {num_to_generate} images with flux-schnell")
         
         try:
-            output = replicate.run(
+            # Wrap replicate.run() in thread pool to avoid blocking event loop
+            output = await asyncio.to_thread(
+                replicate.run,
                 "black-forest-labs/flux-schnell",
                 input={
                     "prompt": request.prompt,
@@ -718,8 +691,8 @@ async def _convert_with_recraft(image_data_url: str) -> Optional[str]:
         )
         # Output is a FileOutput URL to the SVG
         if output:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(str(output))
+            async with get_http_client() as client:
+                resp = await client.get(str(output), timeout=30.0)
                 if resp.status_code == 200:
                     return resp.text
         return None
@@ -853,7 +826,9 @@ async def detect_text(
         logger.info("Calling Replicate datalab-to/ocr")
         
         try:
-            output = replicate.run(
+            # Wrap replicate.run() in thread pool to avoid blocking event loop
+            output = await asyncio.to_thread(
+                replicate.run,
                 "datalab-to/ocr",
                 input={
                     "file": image_data_url,

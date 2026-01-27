@@ -7,10 +7,10 @@ from core.utils.auth_utils import verify_and_get_user_id_from_jwt, get_optional_
 from core.utils.logger import logger
 from core.utils.config import config, EnvMode
 from core.services.supabase import DBConnection
+from core.services.http_client import get_http_client
 from datetime import datetime
 import os
 import hmac
-import httpx
 import asyncio
 import json
 import hashlib
@@ -585,6 +585,45 @@ async def get_toolkit_icon(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.post("/toolkits/icons/batch")
+async def get_toolkit_icons_batch(
+    request: Request,
+    current_user_id: Optional[str] = Depends(get_optional_current_user_id_from_jwt)
+):
+    import asyncio
+    
+    try:
+        body = await request.json()
+        toolkit_slugs = body.get("toolkit_slugs", [])
+        
+        if not toolkit_slugs or not isinstance(toolkit_slugs, list):
+            raise HTTPException(status_code=400, detail="toolkit_slugs must be a non-empty list")
+        
+        if len(toolkit_slugs) > 50:
+            toolkit_slugs = toolkit_slugs[:50]
+        
+        toolkit_service = ToolkitService()
+        
+        async def fetch_icon(slug: str):
+            icon_url = await toolkit_service.get_toolkit_icon(slug)
+            return (slug, icon_url)
+        
+        results = await asyncio.gather(*[fetch_icon(slug) for slug in toolkit_slugs])
+        
+        icons = {slug: icon_url for slug, icon_url in results if icon_url}
+        
+        return {
+            "success": True,
+            "icons": icons
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting toolkit icons batch: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.post("/tools/list")
 async def list_toolkit_tools(
     request: ToolsListRequest,
@@ -729,8 +768,8 @@ async def create_composio_trigger(req: CreateComposioTriggerRequest, current_use
         coerced_config = dict(req.trigger_config or {})
         try:
             type_url = f"{COMPOSIO_API_BASE}/api/v3/triggers_types/{req.slug}"
-            async with httpx.AsyncClient(timeout=10) as http_client:
-                tr = await http_client.get(type_url, headers=headers)
+            async with get_http_client() as http_client:
+                tr = await http_client.get(type_url, headers=headers, timeout=10.0)
                 if tr.status_code == 200:
                     tdata = tr.json()
                     schema = tdata.get("config") or {}
@@ -771,8 +810,8 @@ async def create_composio_trigger(req: CreateComposioTriggerRequest, current_use
         if req.connected_account_id:
             body["connected_account_id"] = req.connected_account_id
 
-        async with httpx.AsyncClient(timeout=20) as http_client:
-            resp = await http_client.post(url, headers=headers, json=body)
+        async with get_http_client() as http_client:
+            resp = await http_client.post(url, headers=headers, json=body, timeout=20.0)
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError:

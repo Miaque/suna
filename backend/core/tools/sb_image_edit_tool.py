@@ -2,7 +2,7 @@ from typing import Optional
 from core.agentpress.tool import ToolResult, openapi_schema, tool_metadata
 from core.sandbox.tool_base import SandboxToolsBase
 from core.agentpress.thread_manager import ThreadManager
-import httpx
+from core.services.http_client import get_http_client
 from io import BytesIO
 import uuid
 import replicate
@@ -20,6 +20,7 @@ from core.utils.config import get_config
 from core.billing.credits.media_integration import media_billing
 from core.billing.credits.media_calculator import select_image_quality, cap_quality_for_tier, FREE_TIERS
 from core.utils.image_processing import upscale_image_sync, remove_background_sync, UPSCALE_MODEL, REMOVE_BG_MODEL
+from core.utils.file_name_generator import generate_smart_filename
 
 
 def parse_image_paths(image_path: Optional[str | list[str]]) -> list[str]:
@@ -63,23 +64,23 @@ def parse_image_paths(image_path: Optional[str | list[str]]) -> list[str]:
 # Generate new image from prompt
 image_edit_or_generate(prompt="A futuristic city at sunset")
 
-# Edit existing image with prompt
+# Edit existing image with prompt (use relative paths, not /workspace prefix)
 image_edit_or_generate(
     action="edit",
-    prompt="Put this person on Mars", 
-    image_path="/workspace/uploads/image.png"
+    prompt="Put this person on Mars with red landscape", 
+    image_path="uploads/image.png"
 )
 
 # Upscale image (no prompt needed)
 image_edit_or_generate(
     action="upscale",
-    image_path="/workspace/uploads/photo.png"
+    image_path="uploads/photo.png"
 )
 
 # Remove background (no prompt needed)
 image_edit_or_generate(
     action="remove_bg",
-    image_path="/workspace/uploads/product.png"
+    image_path="uploads/product.png"
 )
 
 # Generate video
@@ -138,7 +139,15 @@ class SandboxImageEditTool(SandboxToolsBase):
             "type": "function",
             "function": {
                 "name": "image_edit_or_generate",
-                "description": "Generate, edit, upscale, or remove background from images. Also supports video generation. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `prompt` (REQUIRED for generate/edit/video), `action` (optional - 'generate', 'edit', 'upscale', 'remove_bg', 'video'), `image_path` (REQUIRED for upscale/remove_bg/edit), `video_options` (optional), `canvas_path` (optional).",
+                "description": """⚠️ USE CANVAS FOR SPECIFIC DESIGNS! Instagram/TikTok/YouTube/poster/banner → call add_frame_to_canvas (load canvas instructions) FIRST with exact size, get frame_id back, THEN call this with frame_id param!
+ADD TO IMAGE GEN PROMPT FONT SO IT GENERATES MORE ACCURATE TEXT LIKE INTER OR ROBOTO
+Generate, edit, upscale, or remove background from images. Video generation supported.
+
+**ASPECT RATIOS - MANDATORY when using frame_id:**
+- Portrait frames (height > width, e.g. IG Story 1080x1920): aspect_ratio='2:3' 
+- Landscape frames (width > height, e.g. YouTube 1280x720): aspect_ratio='3:2'
+- Square frames (1080x1080): aspect_ratio='1:1'
+**ALWAYS match aspect_ratio to frame orientation!** Default is 1:1 if not specified.""",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -161,13 +170,19 @@ class SandboxImageEditTool(SandboxToolsBase):
                             ],
                             "description": "**REQUIRED for upscale/remove_bg/edit** - Path to input image. Required for upscale, remove_bg, and edit actions."
                         },
+                        "aspect_ratio": {
+                            "type": "string",
+                            "enum": ["1:1", "3:2", "2:3"],
+                            "description": "**MANDATORY when using frame_id!** Match frame orientation: portrait frames (1080x1920)='2:3', landscape (1280x720)='3:2', square (1080x1080)='1:1'. Default: '1:1'."
+                        },
                         "video_options": {
                             "type": "object",
                             "description": "**OPTIONAL** - Include this to generate VIDEO instead of image. Provide an object with optional properties: duration (number, e.g., 5), aspect_ratio (string, e.g., \"16:9\"), fps (number, e.g., 24), generate_audio (boolean), camera_fixed (boolean), last_frame_image (string path)."
                         },
-                        "canvas_path": {"type": "string", "description": "**OPTIONAL** - Canvas file path to auto-add result. Example: 'canvases/my-design.kanvax'."},
-                        "canvas_x": {"type": "number", "description": "**OPTIONAL** - X position on canvas in pixels."},
-                        "canvas_y": {"type": "number", "description": "**OPTIONAL** - Y position on canvas in pixels."}
+                        "canvas_path": {"type": "string", "description": "⚠️ REQUIRED when using frame_id! Path to canvas file. Example: 'canvases/instagram-promo.kanvax'"},
+                        "canvas_x": {"type": "number", "description": "X position on canvas in pixels. Ignored when frame_id is provided."},
+                        "canvas_y": {"type": "number", "description": "Y position on canvas in pixels. Ignored when frame_id is provided."},
+                        "frame_id": {"type": "string", "description": "Frame ID from add_frame_to_canvas. Image auto-centers and fits inside frame. ⚠️ MUST include canvas_path too!"}
                     },
                     "required": [],
                     "additionalProperties": False
@@ -180,9 +195,11 @@ class SandboxImageEditTool(SandboxToolsBase):
         prompt: Optional[str | list[str]] = None,
         action: Optional[str] = None,
         image_path: Optional[str | list[str]] = None,
+        aspect_ratio: Optional[str] = None,
         video_options: Optional[dict] = None,
         canvas_path: Optional[str] = None,
         canvas_x: Optional[float] = None,
+        frame_id: Optional[str] = None,
         canvas_y: Optional[float] = None,
     ) -> ToolResult:
         """Generate/edit/upscale/remove_bg images or generate videos using AI via Replicate."""
@@ -212,7 +229,11 @@ class SandboxImageEditTool(SandboxToolsBase):
             if mode in ("generate", "edit", "video") and not prompt:
                 return ToolResult(success=True, output=f"'{mode}' action requires 'prompt' parameter.")
             
-            logger.info(f"Mode: {mode} (action={action}, image_path={image_path is not None}, video_options={video_options is not None})")
+            # If frame_id is provided, canvas_path is REQUIRED
+            if frame_id and not canvas_path:
+                return ToolResult(success=True, output="ERROR: When using frame_id, canvas_path is REQUIRED! Example: canvas_path='canvases/my-design.kanvax'")
+            
+            logger.info(f"Mode: {mode} (action={action}, image_path={image_path is not None}, video_options={video_options is not None}, frame_id={frame_id})")
             
             # Check if mock mode is enabled (for development/testing)
             use_mock = os.getenv("MOCK_IMAGE_GENERATION", "false").lower() == "true"
@@ -277,13 +298,14 @@ class SandboxImageEditTool(SandboxToolsBase):
                 # If we have one image, use it for all prompts
                 start_time = time.time()
                 tasks = []
+                img_aspect_ratio = aspect_ratio or "1:1"
                 for i, p in enumerate(prompts):
                     if mode == "edit":
                         # Use corresponding image or fall back to first one
                         img_path = image_paths[i] if i < len(image_paths) else image_paths[0]
-                        tasks.append(self._execute_single_image_operation(mode, p, img_path, use_mock, quality_variant))
+                        tasks.append(self._execute_single_image_operation(mode, p, img_path, use_mock, quality_variant, img_aspect_ratio))
                     else:
-                        tasks.append(self._execute_single_image_operation(mode, p, None, use_mock, quality_variant))
+                        tasks.append(self._execute_single_image_operation(mode, p, None, use_mock, quality_variant, img_aspect_ratio))
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 elapsed_time = time.time() - start_time
                 logger.info(f"Batch image operation completed in {elapsed_time:.2f}s (concurrent execution)")
@@ -321,7 +343,7 @@ class SandboxImageEditTool(SandboxToolsBase):
                 canvas_info = None
                 if canvas_path and image_files:
                     canvas_info = await self._add_images_to_canvas(
-                        image_files, canvas_path, canvas_x, canvas_y
+                        image_files, canvas_path, canvas_x, canvas_y, frame_id
                     )
                 
                 # Build concise output
@@ -363,7 +385,7 @@ class SandboxImageEditTool(SandboxToolsBase):
                     # If canvas_path provided, add to canvas
                     if canvas_path:
                         canvas_info = await self._add_images_to_canvas(
-                            [result], canvas_path, canvas_x, canvas_y
+                            [result], canvas_path, canvas_x, canvas_y, frame_id
                         )
                         if canvas_info:
                             output_lines.append(f"Added to canvas: {canvas_path} ({canvas_info['total_elements']} total elements)")
@@ -393,7 +415,7 @@ class SandboxImageEditTool(SandboxToolsBase):
                     # If canvas_path provided, add to canvas
                     if canvas_path:
                         canvas_info = await self._add_images_to_canvas(
-                            [result], canvas_path, canvas_x, canvas_y
+                            [result], canvas_path, canvas_x, canvas_y, frame_id
                         )
                         if canvas_info:
                             output_lines.append(f"Added to canvas: {canvas_path} ({canvas_info['total_elements']} total elements)")
@@ -432,9 +454,10 @@ class SandboxImageEditTool(SandboxToolsBase):
                     return ToolResult(success=True, output=f"Video saved as: /workspace/{result}")
                 
                 # Image mode (generate/edit)
-                logger.info(f"Executing single image operation with mode '{mode}' for prompt: '{prompt[:50]}...' (quality={quality_variant})")
+                img_aspect_ratio = aspect_ratio or "1:1"
+                logger.info(f"Executing single image operation with mode '{mode}' for prompt: '{prompt[:50]}...' (quality={quality_variant}, aspect_ratio={img_aspect_ratio})")
                 
-                result = await self._execute_single_image_operation(mode, prompt, image_path, use_mock, quality_variant)
+                result = await self._execute_single_image_operation(mode, prompt, image_path, use_mock, quality_variant, img_aspect_ratio)
                 
                 if isinstance(result, ToolResult):
                     # Error - return gracefully with friendly message
@@ -457,7 +480,7 @@ class SandboxImageEditTool(SandboxToolsBase):
                 # If canvas_path provided, add to canvas
                 if canvas_path:
                     canvas_info = await self._add_images_to_canvas(
-                        [result], canvas_path, canvas_x, canvas_y
+                        [result], canvas_path, canvas_x, canvas_y, frame_id
                     )
                     if canvas_info:
                         output_lines.append(f"Added to canvas: {canvas_path} ({canvas_info['total_elements']} total elements)")
@@ -484,7 +507,8 @@ class SandboxImageEditTool(SandboxToolsBase):
         prompt: str,
         image_path: Optional[str],
         use_mock: bool,
-        quality: str = "medium"
+        quality: str = "medium",
+        aspect_ratio: str = "1:1"
     ) -> str | ToolResult:
         """
         Helper function to execute a single image generation or edit operation.
@@ -496,11 +520,17 @@ class SandboxImageEditTool(SandboxToolsBase):
         - image_path: Path to image (required for edit mode)
         - use_mock: Whether to use mock mode
         - quality: Quality variant ('low', 'medium', 'high') - affects output quality and cost
+        - aspect_ratio: Output aspect ratio ('1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3')
         
         Returns:
         - str: Filename of the generated/edited image on success
         - ToolResult: Error result on failure
         """
+        # Validate aspect_ratio - only 3 ratios supported by the API
+        valid_ratios = ["1:1", "3:2", "2:3"]
+        if aspect_ratio not in valid_ratios:
+            aspect_ratio = "1:1"  # Default to square if invalid
+        
         try:
             if use_mock:
                 logger.warning(f"🎨 Image generation running in MOCK mode for prompt: '{prompt[:50]}...'")
@@ -514,12 +544,14 @@ class SandboxImageEditTool(SandboxToolsBase):
             self._get_replicate_token()
 
             if mode == "generate":
-                logger.info(f"Calling Replicate openai/gpt-image-1.5 for generation (quality={quality})")
-                output = replicate.run(
+                logger.info(f"Calling Replicate openai/gpt-image-1.5 for generation (quality={quality}, aspect_ratio={aspect_ratio})")
+                # Wrap replicate.run() in thread pool to avoid blocking event loop
+                output = await asyncio.to_thread(
+                    replicate.run,
                     "openai/gpt-image-1.5",
                     input={
                         "prompt": prompt,
-                        "aspect_ratio": "1:1",
+                        "aspect_ratio": aspect_ratio,
                         "number_of_images": 1,
                         "quality": quality,
                     }
@@ -536,13 +568,15 @@ class SandboxImageEditTool(SandboxToolsBase):
                 image_b64 = base64.b64encode(image_bytes).decode('utf-8')
                 image_data_url = f"data:image/png;base64,{image_b64}"
 
-                logger.info(f"Calling Replicate openai/gpt-image-1.5 for editing (quality={quality}) with image_path='{image_path}' (image size: {len(image_bytes)} bytes)")
-                output = replicate.run(
+                logger.info(f"Calling Replicate openai/gpt-image-1.5 for editing (quality={quality}, aspect_ratio={aspect_ratio}) with image_path='{image_path}' (image size: {len(image_bytes)} bytes)")
+                # Wrap replicate.run() in thread pool to avoid blocking event loop
+                output = await asyncio.to_thread(
+                    replicate.run,
                     "openai/gpt-image-1.5",
                     input={
                         "prompt": prompt,
                         "input_images": [image_data_url],  # Note: input_images is an ARRAY
-                        "aspect_ratio": "1:1",
+                        "aspect_ratio": aspect_ratio,
                         "number_of_images": 1,
                         "quality": quality,
                     }
@@ -562,17 +596,21 @@ class SandboxImageEditTool(SandboxToolsBase):
             else:
                 # Fetch from URL if it's a URL string
                 url = str(first_output.url) if hasattr(first_output, 'url') else str(first_output)
-                async with httpx.AsyncClient() as client:
+                async with get_http_client() as client:
                     response = await client.get(url)
                     response.raise_for_status()
                     result_bytes = response.content
 
-            # Save to sandbox with random filename
-            random_filename = f"generated_image_{uuid.uuid4().hex[:8]}.png"
-            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            # Generate smart filename using LLM based on the prompt
+            smart_filename = await generate_smart_filename(
+                prompt=prompt,
+                file_type="image",
+                extension="png"
+            )
+            sandbox_path = f"{self.workspace_path}/{smart_filename}"
             await self.sandbox.fs.upload_file(result_bytes, sandbox_path)
             
-            return random_filename
+            return smart_filename
 
         except Exception as e:
             error_message = str(e)
@@ -605,8 +643,8 @@ class SandboxImageEditTool(SandboxToolsBase):
         try:
             if use_mock:
                 logger.warning(f"🎬 Video generation running in MOCK mode for prompt: '{prompt[:50]}...'")
-                # For mock, just return a fake filename
-                return f"generated_video_{uuid.uuid4().hex[:8]}.mp4"
+                # For mock, return a descriptive mock filename
+                return f"Mock Video {uuid.uuid4().hex[:6]}.mp4"
             
             # Ensure Replicate token is set
             self._get_replicate_token()
@@ -672,7 +710,9 @@ class SandboxImageEditTool(SandboxToolsBase):
             logger.info(f"Calling Replicate bytedance/seedance-1.5-pro for video generation")
             logger.debug(f"Video params: duration={input_params.get('duration')}, aspect_ratio={input_params.get('aspect_ratio')}, generate_audio={input_params.get('generate_audio')}, has_image={'image' in input_params}")
             
-            output = replicate.run(
+            # Wrap replicate.run() in thread pool to avoid blocking event loop
+            output = await asyncio.to_thread(
+                replicate.run,
                 "bytedance/seedance-1.5-pro",
                 input=input_params
             )
@@ -682,25 +722,29 @@ class SandboxImageEditTool(SandboxToolsBase):
                 result_bytes = output.read()
             elif hasattr(output, 'url'):
                 url = str(output.url)
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    response = await client.get(url)
+                async with get_http_client() as client:
+                    response = await client.get(url, timeout=120.0)
                     response.raise_for_status()
                     result_bytes = response.content
             else:
                 # Try to fetch from string URL
                 url = str(output)
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    response = await client.get(url)
+                async with get_http_client() as client:
+                    response = await client.get(url, timeout=120.0)
                     response.raise_for_status()
                     result_bytes = response.content
             
-            # Save to sandbox with random filename
-            random_filename = f"generated_video_{uuid.uuid4().hex[:8]}.mp4"
-            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            # Generate smart filename using LLM based on the prompt
+            smart_filename = await generate_smart_filename(
+                prompt=prompt,
+                file_type="video",
+                extension="mp4"
+            )
+            sandbox_path = f"{self.workspace_path}/{smart_filename}"
             await self.sandbox.fs.upload_file(result_bytes, sandbox_path)
             
-            logger.info(f"Video saved: {random_filename}")
-            return random_filename
+            logger.info(f"Video saved: {smart_filename}")
+            return smart_filename
 
         except Exception as e:
             error_message = str(e)
@@ -728,7 +772,7 @@ class SandboxImageEditTool(SandboxToolsBase):
         try:
             if use_mock:
                 logger.warning(f"🔍 Upscale running in MOCK mode for: '{image_path}'")
-                return f"upscaled_image_{uuid.uuid4().hex[:8]}.webp"
+                return f"Mock Upscaled {uuid.uuid4().hex[:6]}.webp"
             
             # Get image bytes
             if isinstance(image_path, list):
@@ -753,14 +797,21 @@ class SandboxImageEditTool(SandboxToolsBase):
                 None, upscale_image_sync, image_bytes, mime_type
             )
             
-            # Save to sandbox with random filename
-            ext = "webp"  # Upscale outputs webp
-            random_filename = f"upscaled_{uuid.uuid4().hex[:8]}.{ext}"
-            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            # Generate a descriptive filename based on original file
+            from pathlib import Path
+            original_stem = Path(image_path).stem
+            # Clean up original name to Title Case
+            # Remove underscores/hyphens and convert to title case
+            clean_stem = re.sub(r'[_\-]+', ' ', original_stem)
+            clean_stem = ' '.join(word.title() for word in clean_stem.split())[:30]
+            if not clean_stem:
+                clean_stem = "Image"
+            smart_filename = f"{clean_stem} Upscaled.webp"
+            sandbox_path = f"{self.workspace_path}/{smart_filename}"
             await self.sandbox.fs.upload_file(result_bytes, sandbox_path)
             
-            logger.info(f"Upscaled image saved: {random_filename}")
-            return random_filename
+            logger.info(f"Upscaled image saved: {smart_filename}")
+            return smart_filename
             
         except Exception as e:
             error_message = str(e)
@@ -787,7 +838,7 @@ class SandboxImageEditTool(SandboxToolsBase):
         try:
             if use_mock:
                 logger.warning(f"✂️ Remove BG running in MOCK mode for: '{image_path}'")
-                return f"nobg_image_{uuid.uuid4().hex[:8]}.png"
+                return f"Mock Transparent {uuid.uuid4().hex[:6]}.png"
             
             # Get image bytes
             if isinstance(image_path, list):
@@ -812,13 +863,20 @@ class SandboxImageEditTool(SandboxToolsBase):
                 None, remove_background_sync, image_bytes, mime_type
             )
             
-            # Save to sandbox with random filename (PNG for transparency)
-            random_filename = f"nobg_{uuid.uuid4().hex[:8]}.png"
-            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            # Generate a descriptive filename based on original file
+            from pathlib import Path
+            original_stem = Path(image_path).stem
+            # Clean up original name to Title Case
+            clean_stem = re.sub(r'[_\-]+', ' ', original_stem)
+            clean_stem = ' '.join(word.title() for word in clean_stem.split())[:30]
+            if not clean_stem:
+                clean_stem = "Image"
+            smart_filename = f"{clean_stem} Transparent.png"
+            sandbox_path = f"{self.workspace_path}/{smart_filename}"
             await self.sandbox.fs.upload_file(result_bytes, sandbox_path)
             
-            logger.info(f"Background removed, saved: {random_filename}")
-            return random_filename
+            logger.info(f"Background removed, saved: {smart_filename}")
+            return smart_filename
             
         except Exception as e:
             error_message = str(e)
@@ -872,7 +930,7 @@ class SandboxImageEditTool(SandboxToolsBase):
     async def _download_image_from_url(self, url: str) -> bytes | ToolResult:
         """Download image from URL."""
         try:
-            async with httpx.AsyncClient() as client:
+            async with get_http_client() as client:
                 response = await client.get(url)
                 response.raise_for_status()
                 return response.content
@@ -883,13 +941,6 @@ class SandboxImageEditTool(SandboxToolsBase):
         """Read image from sandbox filesystem."""
         try:
             cleaned_path = self.clean_path(image_path)
-            
-            # If path already starts with /workspace/, strip it to avoid doubling
-            if cleaned_path.startswith("/workspace/"):
-                cleaned_path = cleaned_path[len("/workspace/"):]
-            elif cleaned_path.startswith("workspace/"):
-                cleaned_path = cleaned_path[len("workspace/"):]
-            
             full_path = f"{self.workspace_path}/{cleaned_path}"
 
             # Check if file exists and is not a directory
@@ -906,20 +957,27 @@ class SandboxImageEditTool(SandboxToolsBase):
                 f"Could not read image file from sandbox: {image_path} - {str(e)}"
             )
 
-    async def _process_image_response(self, response) -> str | ToolResult:
-        """Download generated image and save to sandbox with random name."""
+    async def _process_image_response(self, response, prompt: str = "") -> str | ToolResult:
+        """Download generated image and save to sandbox with descriptive name."""
         try:
             original_b64_str = response.data[0].b64_json
             # Decode base64 image data
             image_data = base64.b64decode(original_b64_str)
 
-            # Generate random filename
-            random_filename = f"generated_image_{uuid.uuid4().hex[:8]}.png"
-            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            # Generate smart filename if prompt available, otherwise use fallback
+            if prompt:
+                smart_filename = await generate_smart_filename(
+                    prompt=prompt,
+                    file_type="image",
+                    extension="png"
+                )
+            else:
+                smart_filename = f"Image {uuid.uuid4().hex[:6]}.png"
+            sandbox_path = f"{self.workspace_path}/{smart_filename}"
 
             # Save image to sandbox
             await self.sandbox.fs.upload_file(image_data, sandbox_path)
-            return random_filename
+            return smart_filename
 
         except Exception as e:
             return self.fail_response(f"Failed to download and save image: {str(e)}")
@@ -932,18 +990,18 @@ class SandboxImageEditTool(SandboxToolsBase):
             placeholder_url = f"https://picsum.photos/1024/1024?random={random_id}"
             
             # Download the image
-            async with httpx.AsyncClient() as client:
+            async with get_http_client() as client:
                 response = await client.get(placeholder_url, follow_redirects=True)
                 response.raise_for_status()
                 image_data = response.content
             
-            # Generate random filename
-            random_filename = f"generated_image_{uuid.uuid4().hex[:8]}.png"
-            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            # Generate descriptive filename for mock image
+            mock_filename = f"Mock Image {uuid.uuid4().hex[:6]}.png"
+            sandbox_path = f"{self.workspace_path}/{mock_filename}"
             
             # Save to sandbox
             await self.sandbox.fs.upload_file(image_data, sandbox_path)
-            return random_filename
+            return mock_filename
             
         except Exception as e:
             return self.fail_response(f"Failed to download placeholder image: {str(e)}")
@@ -954,9 +1012,11 @@ class SandboxImageEditTool(SandboxToolsBase):
         canvas_path: str,
         start_x: Optional[float] = None,
         start_y: Optional[float] = None,
+        frame_id: Optional[str] = None,
     ) -> Optional[dict]:
         """
         Add images to a canvas. Creates the canvas if it doesn't exist.
+        If frame_id is provided, images are placed centered inside the frame and sized to fit.
         Returns info about the canvas update or None on failure.
         """
         try:
@@ -990,18 +1050,33 @@ class SandboxImageEditTool(SandboxToolsBase):
                 }
                 logger.info(f"Created new canvas: {canvas_path}")
             
-            # Calculate starting position
-            current_x = start_x if start_x is not None else 50
-            current_y = start_y if start_y is not None else 50
+            # Find target frame if frame_id provided
+            target_frame = None
+            if frame_id:
+                for el in canvas_data.get("elements", []):
+                    if el.get("id") == frame_id and el.get("type") == "frame":
+                        target_frame = el
+                        break
+                if not target_frame:
+                    logger.warning(f"Frame {frame_id} not found in canvas")
             
-            # If no position specified and canvas has elements, calculate next position
-            if start_x is None and start_y is None and canvas_data["elements"]:
-                # Find max Y of existing elements to place new ones below
-                max_y = 0
-                for el in canvas_data["elements"]:
-                    el_bottom = float(el.get("y", 0)) + float(el.get("height", 400))
-                    max_y = max(max_y, el_bottom)
-                current_y = max_y + 50  # 50px gap
+            # Calculate starting position
+            if target_frame:
+                # Position inside frame - will calculate per image for centering
+                current_x = target_frame["x"]
+                current_y = target_frame["y"]
+            else:
+                current_x = start_x if start_x is not None else 50
+                current_y = start_y if start_y is not None else 50
+                
+                # If no position specified and canvas has elements, calculate next position
+                if start_x is None and start_y is None and canvas_data["elements"]:
+                    # Find max Y of existing elements to place new ones below
+                    max_y = 0
+                    for el in canvas_data["elements"]:
+                        el_bottom = float(el.get("y", 0)) + float(el.get("height", 400))
+                        max_y = max(max_y, el_bottom)
+                    current_y = max_y + 50  # 50px gap
             
             # Add each image to canvas
             for i, image_file in enumerate(image_files):
@@ -1018,19 +1093,31 @@ class SandboxImageEditTool(SandboxToolsBase):
                     except:
                         actual_width, actual_height = 1024, 1024
                     
-                    # Scale down if needed (max 600px)
-                    max_size = 600
-                    aspect_ratio = actual_width / actual_height if actual_height > 0 else 1
-                    if actual_width > max_size or actual_height > max_size:
-                        if actual_width > actual_height:
-                            elem_width = max_size
-                            elem_height = max_size / aspect_ratio
+                    # Calculate element size - use actual size (no cap, canvas is infinite)
+                    elem_width = actual_width
+                    elem_height = actual_height
+                    
+                    # If placing inside frame, scale to fit and center
+                    if target_frame:
+                        frame_w = target_frame["width"]
+                        frame_h = target_frame["height"]
+                        
+                        # Scale to fit within frame while maintaining aspect ratio
+                        img_aspect = actual_width / actual_height if actual_height > 0 else 1
+                        frame_aspect = frame_w / frame_h if frame_h > 0 else 1
+                        
+                        if img_aspect > frame_aspect:
+                            # Image is wider than frame - fit to width
+                            elem_width = frame_w
+                            elem_height = frame_w / img_aspect
                         else:
-                            elem_height = max_size
-                            elem_width = max_size * aspect_ratio
-                    else:
-                        elem_width = actual_width
-                        elem_height = actual_height
+                            # Image is taller than frame - fit to height
+                            elem_height = frame_h
+                            elem_width = frame_h * img_aspect
+                        
+                        # Center inside frame
+                        current_x = target_frame["x"] + (frame_w - elem_width) / 2
+                        current_y = target_frame["y"] + (frame_h - elem_height) / 2
                     
                     # Create element with PATH reference (NOT base64 - avoids LLM context bloat)
                     # Frontend canvas-renderer.tsx fetches images via sandbox API
@@ -1053,10 +1140,12 @@ class SandboxImageEditTool(SandboxToolsBase):
                     canvas_data["elements"].append(element)
                     
                     # Move position for next image (horizontal layout with wrapping)
-                    current_x += elem_width + 50
-                    if current_x > 1200:  # Wrap to next row
-                        current_x = 50
-                        current_y += elem_height + 50
+                    # Only applies if not targeting a frame
+                    if not target_frame:
+                        current_x += elem_width + 50
+                        if current_x > 2400:  # Wrap to next row (increased from 1200)
+                            current_x = 50
+                            current_y += elem_height + 50
                         
                 except Exception as e:
                     logger.warning(f"Failed to add {image_file} to canvas: {e}")

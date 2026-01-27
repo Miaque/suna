@@ -5,23 +5,40 @@ from core.utils.config import config
 from core.services.supabase import DBConnection
 import uuid
 
+# Namespace UUID for generating deterministic UUIDs from non-UUID session IDs
+PRESENCE_SESSION_NAMESPACE = uuid.UUID('a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+
+
 class PresenceService:
     def __init__(self):
         self.db = DBConnection()
         self.activity_threshold_minutes = 2
         self.stale_session_threshold_minutes = 5
     
+    def _normalize_session_id(self, session_id: str) -> str:
+        """
+        Convert session_id to a valid UUID format.
+        If session_id is already a valid UUID, return it as-is.
+        Otherwise, generate a deterministic UUID5 from the session_id.
+        """
+        try:
+            # Check if it's already a valid UUID
+            uuid.UUID(session_id)
+            return session_id
+        except (ValueError, AttributeError):
+            # Not a valid UUID - generate a deterministic UUID5 from the session_id
+            deterministic_uuid = uuid.uuid5(PRESENCE_SESSION_NAMESPACE, session_id)
+            logger.debug(f"Converted non-UUID session_id '{session_id}' to UUID '{deterministic_uuid}'")
+            return str(deterministic_uuid)
+    
     async def _validate_account_id(self, account_id: str) -> bool:
-        """Validate that account_id exists and is a valid UUID."""
         try:
             # Validate UUID format
             uuid.UUID(account_id)
+            from core.notifications import presence_repo
+            exists = await presence_repo.validate_account_exists(account_id)
             
-            # Check if account exists in basejump.accounts
-            client = await self.db.client
-            result = await client.schema('basejump').from_('accounts').select('id').eq('id', account_id).limit(1).execute()
-            
-            if not result.data or len(result.data) == 0:
+            if not exists:
                 logger.warning(f"Account {account_id} does not exist in basejump.accounts")
                 return False
             
@@ -34,20 +51,19 @@ class PresenceService:
             return False
     
     async def _fetch_session(self, session_id: str):
-        """Fetch a presence session by session_id. Returns None if not found (handles 204 responses silently)."""
+        """Fetch a presence session by session_id. Returns None if not found."""
         try:
-            client = await self.db.client
-            return await client.table('user_presence_sessions').select('*').eq(
-                'session_id', session_id
-            ).maybe_single().execute()
+            from core.notifications import presence_repo
+            session = await presence_repo.get_presence_session(session_id)
+            # Return in a format compatible with previous API
+            if session:
+                class Result:
+                    data = session
+                return Result()
+            return None
         except Exception as e:
-            # Handle PostgREST 204 "Missing response" - this is a valid "not found" case, not an error
-            error_str = str(e).lower()
-            if '204' in error_str and 'missing response' in error_str:
-                # Session not found - return None silently (not an error)
-                return None
-            # Re-raise other exceptions
-            raise
+            logger.debug(f"Error fetching session {session_id}: {e}")
+            return None
 
     async def _upsert_session(
         self,
@@ -58,7 +74,7 @@ class PresenceService:
         client_timestamp: Optional[str],
         device_info: Optional[Dict] = None
     ) -> Tuple[Any, str]:
-        client = await self.db.client
+        from core.notifications import presence_repo
         now = datetime.now(timezone.utc).isoformat()
         
         # Validate required fields
@@ -75,42 +91,27 @@ class PresenceService:
         if not platform:
             platform = "web"
         
-        payload = {
-            'session_id': session_id,
-            'account_id': account_id,
-            'active_thread_id': active_thread_id,
-            'last_seen': now,
-            'platform': platform,
-            'device_info': device_info or {},
-            'client_timestamp': client_timestamp or now,
-            'updated_at': now
-        }
-        
         try:
-            # Attempt upsert - service role client should bypass RLS, but handle errors gracefully
-            result = await client.table('user_presence_sessions').upsert(payload).execute()
-            return result, now
+            success = await presence_repo.upsert_presence_session(
+                session_id=session_id,
+                account_id=account_id,
+                active_thread_id=active_thread_id,
+                platform=platform,
+                client_timestamp=client_timestamp,
+                device_info=device_info
+            )
+            if not success:
+                raise ValueError(f"Failed to upsert presence session {session_id}")
+            return None, now
         except Exception as e:
             error_str = str(e).lower()
-            # Check for RLS policy violations
-            if 'row-level security' in error_str or 'policy' in error_str or 'permission denied' in error_str:
-                logger.error(
-                    f"RLS policy violation when upserting presence session {session_id} for account {account_id}: {str(e)}"
-                )
-                logger.error(f"Payload: {payload}")
-                # Re-raise with clearer error message
+            if 'permission denied' in error_str or 'policy' in error_str:
                 raise ValueError(f"Permission denied: Unable to update presence for account {account_id}. This may indicate an account membership issue.")
-            else:
-                # Log the full error for debugging
-                logger.error(f"Error upserting presence session {session_id} for account {account_id}: {str(e)}")
-                logger.error(f"Payload: {payload}")
-                raise
+            raise
 
     async def _delete_session(self, session_id: str):
-        client = await self.db.client
-        await client.table('user_presence_sessions').delete().eq(
-            'session_id', session_id
-        ).execute()
+        from core.notifications import presence_repo
+        await presence_repo.delete_presence_session(session_id)
 
     def _is_stale(self, client_timestamp: Optional[str], existing_timestamp: Optional[str]) -> bool:
         if not client_timestamp or not existing_timestamp:
@@ -134,6 +135,9 @@ class PresenceService:
     ) -> bool:
         if config.DISABLE_PRESENCE:
             return True
+        
+        # Normalize session_id to valid UUID format
+        session_id = self._normalize_session_id(session_id)
         
         try:
             existing = await self._fetch_session(session_id)
@@ -185,6 +189,9 @@ class PresenceService:
         if config.DISABLE_PRESENCE:
             return True
         
+        # Normalize session_id to valid UUID format
+        session_id = self._normalize_session_id(session_id)
+        
         try:
             await self._delete_session(session_id)
             logger.debug(f"Presence cleared for session {session_id}, account {account_id}")
@@ -198,19 +205,17 @@ class PresenceService:
             return 0
         
         try:
-            client = await self.db.client
-            threshold = datetime.now(timezone.utc) - timedelta(minutes=self.stale_session_threshold_minutes)
-            
-            query = client.table('user_presence_sessions').delete().lt('last_seen', threshold.isoformat())
+            from core.notifications import presence_repo
             
             if account_id:
-                query = query.eq('account_id', account_id)
                 logger.debug(f"Cleaning up stale sessions for account {account_id}")
             else:
                 logger.debug("Cleaning up all stale sessions")
             
-            result = await query.execute()
-            count = len(result.data) if result.data else 0
+            count = await presence_repo.delete_stale_sessions(
+                self.stale_session_threshold_minutes,
+                account_id
+            )
             
             if count > 0:
                 logger.info(f"Cleaned up {count} stale presence sessions")
@@ -226,18 +231,17 @@ class PresenceService:
             return False
         
         try:
-            client = await self.db.client
-            result = await client.table('user_presence_sessions').select('*').eq(
-                'account_id', account_id
-            ).eq('active_thread_id', thread_id).execute()
+            from core.notifications import presence_repo
             
-            if not result.data:
+            sessions = await presence_repo.get_sessions_by_account_and_thread(account_id, thread_id)
+            
+            if not sessions:
                 return False
             
             threshold = datetime.now(timezone.utc) - timedelta(minutes=self.activity_threshold_minutes)
             return any(
-                datetime.fromisoformat(session['last_seen'].replace('Z', '+00:00')) > threshold
-                for session in result.data
+                datetime.fromisoformat(str(session['last_seen']).replace('Z', '+00:00')) > threshold
+                for session in sessions
             )
         except Exception as e:
             logger.error(f"Error checking account presence: {str(e)}")

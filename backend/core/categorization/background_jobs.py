@@ -1,117 +1,127 @@
-"""Background jobs for project categorization."""
-import dramatiq
-import os
+"""Categorization background job functions."""
+
+import asyncio
 from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any
+
 from core.utils.logger import logger
 from core.services.supabase import DBConnection
-from .service import categorize_from_messages
 
-QUEUE_PREFIX = os.getenv("DRAMATIQ_QUEUE_PREFIX", "")
-
-def get_queue_name(base_name: str) -> str:
-    return f"{QUEUE_PREFIX}{base_name}" if QUEUE_PREFIX else base_name
-
-db = DBConnection()
-
-STALE_THRESHOLD_MINUTES = 30
-MIN_USER_MESSAGES = 1
-MAX_PROJECTS_PER_RUN = 50
-DELAY_BETWEEN_PROJECTS_MS = 2000  # 2 second delay between tasks
+_db = DBConnection()
 
 
-@dramatiq.actor(queue_name=get_queue_name("default"))
-async def categorize_project(project_id: str):
-    """Categorize a project based on its thread messages."""
-    logger.info(f"Categorizing project {project_id}")
+async def run_categorization(project_id: str) -> None:
+    """Categorize project - runs as async background task."""
+    from core.utils.init_helpers import initialize
     
-    await db.initialize()
-    client = await db.client
+    logger.info(f"🏷️ Categorizing project: {project_id}")
+    
+    await initialize()
     
     try:
-        # Get the thread for this project
-        thread_result = await client.table('threads').select(
-            'thread_id'
-        ).eq('project_id', project_id).limit(1).execute()
+        from core.categorization.service import categorize_from_messages
         
-        if not thread_result.data:
-            logger.debug(f"No thread for project {project_id}")
-            # Mark as categorized to avoid re-processing
-            await client.table('projects').update({
-                'last_categorized_at': datetime.now(timezone.utc).isoformat()
-            }).eq('project_id', project_id).execute()
+        client = await _db.client
+        
+        threads = await client.table('threads').select('thread_id').eq('project_id', project_id).limit(1).execute()
+        if not threads.data:
+            await client.table('projects').update({'last_categorized_at': datetime.now(timezone.utc).isoformat()}).eq('project_id', project_id).execute()
             return
         
-        thread_id = thread_result.data[0]['thread_id']
+        thread_id = threads.data[0]['thread_id']
         
-        # Get messages (type = role, content is JSONB)
-        messages_result = await client.table('messages').select(
-            'type', 'content'
-        ).eq('thread_id', thread_id).order('created_at').execute()
+        messages = await client.table('messages').select('type', 'content').eq('thread_id', thread_id).order('created_at').execute()
         
-        messages = messages_result.data or []
-        
-        # Check minimum user messages (type='user' not role='user')
-        user_count = sum(1 for m in messages if m.get('type') == 'user')
-        if user_count < MIN_USER_MESSAGES:
-            logger.debug(f"Project {project_id} has only {user_count} user messages")
-            await client.table('projects').update({
-                'last_categorized_at': datetime.now(timezone.utc).isoformat()
-            }).eq('project_id', project_id).execute()
+        user_count = sum(1 for m in (messages.data or []) if m.get('type') == 'user')
+        if user_count < 1:
+            await client.table('projects').update({'last_categorized_at': datetime.now(timezone.utc).isoformat()}).eq('project_id', project_id).execute()
             return
         
-        # Categorize
-        categories = await categorize_from_messages(messages)
-        if not categories:
-            categories = ["Other"]
+        categories = await categorize_from_messages(messages.data) or ["Other"]
         
-        # Update project
         await client.table('projects').update({
             'categories': categories,
             'last_categorized_at': datetime.now(timezone.utc).isoformat()
         }).eq('project_id', project_id).execute()
         
-        logger.info(f"Categorized project {project_id}: {categories}")
+        logger.info(f"✅ Categorized project {project_id}: {categories}")
         
     except Exception as e:
-        logger.error(f"Categorization failed for project {project_id}: {e}")
+        logger.error(f"Categorization failed: {e}", exc_info=True)
 
 
-@dramatiq.actor(queue_name=get_queue_name("default"))
-async def process_stale_projects():
-    """Find and categorize projects inactive for 30+ minutes."""
-    logger.info("Processing stale projects for categorization")
+async def run_stale_projects() -> None:
+    """Process stale projects - runs as async background task."""
+    from core.utils.init_helpers import initialize
     
-    await db.initialize()
-    client = await db.client
+    logger.info("🕐 Processing stale projects")
+    
+    await initialize()
     
     try:
-        stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=STALE_THRESHOLD_MINUTES)
+        client = await _db.client
         
-        # Find projects: inactive 30+ mins AND (never categorized OR has new activity)
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        
         result = await client.rpc(
             'get_stale_projects_for_categorization',
-            {
-                'stale_threshold': stale_threshold.isoformat(),
-                'max_count': MAX_PROJECTS_PER_RUN
-            }
+            {'stale_threshold': cutoff, 'max_count': 50}
         ).execute()
         
-        projects = result.data or []
+        for project in result.data or []:
+            asyncio.create_task(run_categorization(project['project_id']))
         
-        if not projects:
-            logger.debug("No stale projects to categorize")
-            return
-        
-        logger.info(f"Found {len(projects)} stale projects")
-        
-        for i, project in enumerate(projects):
-            # Stagger task dispatch to avoid rate limits
-            delay_ms = i * DELAY_BETWEEN_PROJECTS_MS
-            categorize_project.send_with_options(
-                args=(project['project_id'],),
-                delay=delay_ms
-            )
+        logger.info(f"✅ Queued {len(result.data or [])} stale projects")
         
     except Exception as e:
-        logger.error(f"Stale project processing failed: {e}")
+        logger.error(f"Stale projects processing failed: {e}", exc_info=True)
 
+
+def start_categorization(project_id: str) -> None:
+    """Start categorization as background task."""
+    asyncio.create_task(run_categorization(project_id))
+    logger.debug(f"Started categorization for project {project_id}")
+
+
+def start_stale_projects() -> None:
+    """Start stale projects processing as background task."""
+    asyncio.create_task(run_stale_projects())
+    logger.debug("Started stale projects processing")
+
+
+async def categorize(project_id: str):
+    """Start project categorization task."""
+    start_categorization(project_id)
+
+
+async def process_stale():
+    """Start stale projects processing task."""
+    start_stale_projects()
+
+
+# Backwards-compatible wrappers with .send() interface
+class _DispatchWrapper:
+    def __init__(self, dispatch_fn):
+        self._dispatch_fn = dispatch_fn
+    
+    def send(self, *args, **kwargs):
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(self._dispatch_fn(*args, **kwargs))
+        except RuntimeError:
+            asyncio.run(self._dispatch_fn(*args, **kwargs))
+    
+    def send_with_options(self, args=None, kwargs=None, delay=None):
+        args = args or ()
+        kwargs = kwargs or {}
+        self.send(*args, **kwargs)
+
+
+categorize_project = _DispatchWrapper(
+    lambda project_id: start_categorization(project_id)
+)
+
+process_stale_projects = _DispatchWrapper(
+    lambda: start_stale_projects()
+)

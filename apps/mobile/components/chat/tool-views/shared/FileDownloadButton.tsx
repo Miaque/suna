@@ -2,11 +2,13 @@ import React, { useState } from 'react';
 import { View, Pressable, Modal, Platform, Alert } from 'react-native';
 import { Text } from '@/components/ui/text';
 import { Icon } from '@/components/ui/icon';
-import { Download, Loader2, FileType, FileText, FileCode, X } from 'lucide-react-native';
+import { KortixLoader } from '@/components/ui/kortix-loader';
+import { Download, FileType, FileText, FileCode, X } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import { API_URL, getAuthHeaders } from '@/api/config';
+import { log } from '@/lib/logger';
 
 interface FileDownloadButtonProps {
   /** The file content to download/export */
@@ -17,6 +19,8 @@ interface FileDownloadButtonProps {
   disabled?: boolean;
   /** Custom class name for the button */
   className?: string;
+  /** Optional sandbox URL for high-quality PDF export via Playwright */
+  sandboxUrl?: string;
 }
 
 export type ExportFormat = 'pdf' | 'docx' | 'html' | 'markdown' | 'text';
@@ -38,14 +42,16 @@ export function FileDownloadButton({
   fileName,
   disabled = false,
   className,
+  sandboxUrl,
 }: FileDownloadButtonProps) {
   const [isExporting, setIsExporting] = useState(false);
   const [exportingFormat, setExportingFormat] = useState<ExportFormat | null>(null);
   const [showExportModal, setShowExportModal] = useState(false);
 
-  // Check if file is markdown
+  // Check if file is markdown or HTML
   const fileExtension = fileName.split('.').pop()?.toLowerCase() || '';
   const isMarkdown = fileExtension === 'md' || fileExtension === 'markdown';
+  const isHtml = fileExtension === 'html' || fileExtension === 'htm';
 
   // Export options for markdown files
   const exportOptions: ExportOption[] = [
@@ -72,6 +78,22 @@ export function FileDownloadButton({
       label: 'Markdown',
       icon: FileCode,
       description: 'Plain Text Markdown',
+    },
+  ];
+
+  // Export options for HTML files
+  const htmlExportOptions: ExportOption[] = [
+    {
+      format: 'pdf',
+      label: 'PDF',
+      icon: FileType,
+      description: 'Portable Document Format',
+    },
+    {
+      format: 'html',
+      label: 'HTML',
+      icon: FileCode,
+      description: 'Web Page',
     },
   ];
 
@@ -235,7 +257,7 @@ ${content}
       // Use backend API endpoint
       const endpoint = `${API_URL}/export/${format}`;
 
-      console.log(`[FileDownloadButton] Calling ${format.toUpperCase()} export API:`, endpoint);
+      log.log(`[FileDownloadButton] Calling ${format.toUpperCase()} export API:`, endpoint);
 
       // Get auth headers
       const authHeaders = await getAuthHeaders();
@@ -251,7 +273,7 @@ ${content}
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error(`[FileDownloadButton] ${format.toUpperCase()} API error response:`, errorText);
+        log.error(`[FileDownloadButton] ${format.toUpperCase()} API error response:`, errorText);
 
         let errorMessage = `Export failed with status ${response.status}`;
         try {
@@ -289,7 +311,7 @@ ${content}
         reader.readAsDataURL(blob);
       });
     } catch (error) {
-      console.error(`[FileDownloadButton] ${format.toUpperCase()} export API error:`, error);
+      log.error(`[FileDownloadButton] ${format.toUpperCase()} export API error:`, error);
       Alert.alert(
         'Export Failed',
         `Failed to export as ${format.toUpperCase()}: ${error instanceof Error ? error.message : 'Unknown error'}`
@@ -310,7 +332,7 @@ ${content}
     try {
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
-      const baseFileName = fileName.replace(/\.(md|markdown)$/i, '');
+      const baseFileName = fileName.replace(/\.(md|markdown|html|htm)$/i, '');
       let fileUri = '';
       let mimeType = 'application/octet-stream';
       let exportFileName = fileName;
@@ -326,9 +348,19 @@ ${content}
         }
 
         case 'html': {
-          // Convert markdown to HTML and export
-          const htmlContent = isMarkdown ? convertMarkdownToHtml(content) : content;
-          const fullHtml = createHtmlDocument(htmlContent, baseFileName);
+          // For HTML files, export as-is. For markdown, convert to HTML first.
+          let fullHtml: string;
+          if (isHtml) {
+            // HTML file - export raw content
+            fullHtml = content;
+          } else if (isMarkdown) {
+            // Markdown file - convert to HTML and wrap in document
+            const htmlContent = convertMarkdownToHtml(content);
+            fullHtml = createHtmlDocument(htmlContent, baseFileName);
+          } else {
+            // Other files - wrap in document
+            fullHtml = createHtmlDocument(content, baseFileName);
+          }
           exportFileName = `${baseFileName}.html`;
           fileUri = `${FileSystem.cacheDirectory}${exportFileName}`;
           await FileSystem.writeAsStringAsync(fileUri, fullHtml);
@@ -337,12 +369,58 @@ ${content}
         }
 
         case 'pdf': {
-          // Call API for PDF conversion
+          // Use sandbox Playwright for high-quality PDF if available
           const htmlContent = isMarkdown ? convertMarkdownToHtml(content) : content;
-          console.log('[FileDownloadButton] PDF export - HTML length:', htmlContent.length);
-          console.log('[FileDownloadButton] PDF export - HTML preview:', htmlContent.substring(0, 200));
+          log.log('[FileDownloadButton] PDF export - HTML length:', htmlContent.length);
+          log.log('[FileDownloadButton] PDF export - Using sandbox:', !!sandboxUrl);
 
-          const convertedUri = await callExportAPI(htmlContent, baseFileName, 'pdf');
+          let convertedUri: string | null = null;
+
+          if (sandboxUrl) {
+            // Use sandbox endpoint for high-quality PDF
+            try {
+              const response = await fetch(`${sandboxUrl}/presentation/html-to-pdf`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  content: htmlContent,
+                  file_name: baseFileName,
+                }),
+              });
+
+              if (!response.ok) {
+                throw new Error(`Sandbox PDF export failed: ${response.status}`);
+              }
+
+              const blob = await response.blob();
+              const tempFileUri = `${FileSystem.cacheDirectory}${baseFileName}.pdf`;
+
+              // Convert blob to base64 and write to file
+              const reader = new FileReader();
+              convertedUri = await new Promise<string | null>((resolve, reject) => {
+                reader.onloadend = async () => {
+                  try {
+                    const base64data = (reader.result as string).split(',')[1];
+                    await FileSystem.writeAsStringAsync(tempFileUri, base64data, {
+                      encoding: FileSystem.EncodingType.Base64,
+                    });
+                    resolve(tempFileUri);
+                  } catch (err) {
+                    reject(err);
+                  }
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+              });
+            } catch (error) {
+              log.error('[FileDownloadButton] Sandbox PDF export failed, falling back to backend:', error);
+              // Fall back to backend API
+              convertedUri = await callExportAPI(htmlContent, baseFileName, 'pdf');
+            }
+          } else {
+            // Use backend API
+            convertedUri = await callExportAPI(htmlContent, baseFileName, 'pdf');
+          }
 
           if (!convertedUri) {
             setIsExporting(false);
@@ -360,8 +438,8 @@ ${content}
         case 'docx': {
           // Call API for DOCX conversion
           const htmlContent = isMarkdown ? convertMarkdownToHtml(content) : content;
-          console.log('[FileDownloadButton] DOCX export - HTML length:', htmlContent.length);
-          console.log('[FileDownloadButton] DOCX export - HTML preview:', htmlContent.substring(0, 200));
+          log.log('[FileDownloadButton] DOCX export - HTML length:', htmlContent.length);
+          log.log('[FileDownloadButton] DOCX export - HTML preview:', htmlContent.substring(0, 200));
 
           const convertedUri = await callExportAPI(htmlContent, baseFileName, 'docx');
 
@@ -399,7 +477,7 @@ ${content}
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
     } catch (error) {
-      console.error('[FileDownloadButton] Export error:', error);
+      log.error('[FileDownloadButton] Export error:', error);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       Alert.alert(
         'Export Failed',
@@ -431,15 +509,18 @@ ${content}
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
     } catch (error) {
-      console.error('[FileDownloadButton] Download error:', error);
+      log.error('[FileDownloadButton] Download error:', error);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     } finally {
       setTimeout(() => setIsExporting(false), 500);
     }
   };
 
-  // For markdown files, show button that opens modal
-  if (isMarkdown) {
+  // Get the appropriate export options based on file type
+  const currentExportOptions = isHtml ? htmlExportOptions : exportOptions;
+
+  // For markdown or HTML files, show button that opens modal
+  if (isMarkdown || isHtml) {
     return (
       <>
         <Pressable
@@ -450,11 +531,15 @@ ${content}
           disabled={disabled || isExporting || !content}
           className={`h-9 w-9 items-center justify-center rounded-xl bg-card border border-border active:opacity-70 ${disabled || isExporting || !content ? 'opacity-50' : ''} ${className || ''}`}
         >
-          <Icon
-            as={isExporting ? Loader2 : Download}
-            size={17}
-            className="text-primary"
-          />
+          {isExporting ? (
+            <KortixLoader size="small" customSize={17} />
+          ) : (
+            <Icon
+              as={Download}
+              size={17}
+              className="text-primary"
+            />
+          )}
         </Pressable>
 
         {/* Export Options Modal */}
@@ -492,7 +577,7 @@ ${content}
 
               {/* Export Options */}
               <View className="p-2">
-                {exportOptions.map((option) => (
+                {currentExportOptions.map((option) => (
                   <Pressable
                     key={option.format}
                     onPress={() => handleExport(option.format)}
@@ -501,11 +586,7 @@ ${content}
                   >
                     <View className="h-10 w-10 items-center justify-center rounded-lg bg-primary/10 mr-3">
                       {isExporting && exportingFormat === option.format ? (
-                        <Icon
-                          as={Loader2}
-                          size={20}
-                          className="text-primary"
-                        />
+                        <KortixLoader size="small" customSize={20} />
                       ) : (
                         <Icon
                           as={option.icon}
@@ -548,11 +629,15 @@ ${content}
       disabled={disabled || isExporting || !content}
       className={`h-9 w-9 items-center justify-center rounded-xl bg-card border border-border active:opacity-70 ${disabled || isExporting || !content ? 'opacity-50' : ''} ${className || ''}`}
     >
-      <Icon
-        as={isExporting ? Loader2 : Download}
-        size={17}
-        className="text-primary"
-      />
+      {isExporting ? (
+        <KortixLoader size="small" customSize={17} />
+      ) : (
+        <Icon
+          as={Download}
+          size={17}
+          className="text-primary"
+        />
+      )}
     </Pressable>
   );
 }

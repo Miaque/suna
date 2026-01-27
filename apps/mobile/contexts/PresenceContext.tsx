@@ -5,6 +5,7 @@ import { API_URL, getAuthToken } from '@/api/config';
 import { useAuthContext } from '@/contexts/AuthContext';
 import { supabase } from '@/api/supabase';
 import { RealtimeChannel } from '@supabase/supabase-js';
+import { log } from '@/lib/logger';
 
 type PresenceStatus = 'online' | 'idle' | 'offline';
 
@@ -33,7 +34,7 @@ const HEARTBEAT_INTERVAL = 60000;
 const DEBOUNCE_DELAY = 500;
 const SESSION_STORAGE_KEY = 'presence_session_id';
 
-const DISABLE_PRESENCE = process.env.EXPO_PUBLIC_DISABLE_PRESENCE === 'true';
+const DISABLE_PRESENCE = true;
 
 function generateSessionId(): string {
   return `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
@@ -64,7 +65,7 @@ export function PresenceProvider({ children }: { children: ReactNode }) {
         }
         setSessionId(storedId);
       } catch (error) {
-        console.error('[Presence] Failed to load session ID:', error);
+        log.error('[Presence] Failed to load session ID:', error);
         const fallbackId = generateSessionId();
         setSessionId(fallbackId);
       }
@@ -119,7 +120,7 @@ export function PresenceProvider({ children }: { children: ReactNode }) {
             }),
           });
         } catch (err) {
-          console.error('[Presence] Update failed:', err);
+          log.error('[Presence] Update failed:', err);
           throw err;
         } finally {
           setTimeout(() => {
@@ -267,7 +268,7 @@ export function PresenceProvider({ children }: { children: ReactNode }) {
       
       await AsyncStorage.removeItem(SESSION_STORAGE_KEY);
     } catch (error) {
-      console.error('[Presence] Failed to clear presence:', error);
+      log.error('[Presence] Failed to clear presence:', error);
     }
   }, [sessionId]);
 

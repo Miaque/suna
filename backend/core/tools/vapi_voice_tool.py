@@ -1,7 +1,6 @@
 from typing import Optional, Dict, Any, List
 import json
 import asyncio
-import httpx
 import phonenumbers
 from phonenumbers import NumberParseException, geocoder
 import structlog
@@ -10,7 +9,8 @@ from core.agentpress.tool import Tool, ToolResult, openapi_schema, tool_metadata
 from core.utils.config import config
 from core.agentpress.thread_manager import ThreadManager
 from core.utils.logger import logger
-from core.vapi_config import vapi_config, DEFAULT_SYSTEM_PROMPT, DEFAULT_FIRST_MESSAGE
+from core.services.http_client import get_http_client
+from core.config.vapi_config import vapi_config, DEFAULT_SYSTEM_PROMPT, DEFAULT_FIRST_MESSAGE
 from core.billing.shared.config import TOKEN_PRICE_MULTIPLIER
 
 def normalize_phone_number(raw_number: str, default_region: str = "US") -> tuple[str, str, str]:
@@ -345,9 +345,7 @@ class VapiVoiceTool(Tool):
 
             if not user_id and thread_id:
                 try:
-                    from core.services.supabase import DBConnection
-                    db = DBConnection()
-                    client = await db.client
+                    client = await self.thread_manager.db.client
                     thread = await client.from_('threads').select('account_id').eq('thread_id', thread_id).single().execute()
                     if thread.data:
                         user_id = thread.data.get('account_id')
@@ -439,8 +437,8 @@ class VapiVoiceTool(Tool):
                 "assistant": assistant_config
             }
             
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
+            async with get_http_client() as http_client:
+                response = await http_client.post(
                     f"{self.base_url}/call/phone",
                     headers=self._get_headers(),
                     json=payload,
@@ -450,9 +448,7 @@ class VapiVoiceTool(Tool):
                 response.raise_for_status()
                 call_data = response.json()
             
-            from core.services.supabase import DBConnection
-            db = DBConnection()
-            client = await db.client
+            client = await self.thread_manager.db.client
             
             call_id = call_data.get("id")
             
@@ -563,8 +559,8 @@ class VapiVoiceTool(Tool):
             return self.fail_response("VAPI_PRIVATE_KEY not configured")
         
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.patch(
+            async with get_http_client() as http_client:
+                response = await http_client.patch(
                     f"{self.base_url}/call/{call_id}",
                     headers=self._get_headers(),
                     json={"status": "ended"},
@@ -573,9 +569,7 @@ class VapiVoiceTool(Tool):
                 
                 response.raise_for_status()
             
-            from core.services.supabase import DBConnection
-            db = DBConnection()
-            client = await db.client
+            client = await self.thread_manager.db.client
             
             await client.table("vapi_calls").update({
                 "status": "ended",
@@ -619,8 +613,8 @@ class VapiVoiceTool(Tool):
             return self.fail_response("VAPI_PRIVATE_KEY not configured")
         
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
+            async with get_http_client() as http_client:
+                response = await http_client.get(
                     f"{self.base_url}/call/{call_id}",
                     headers=self._get_headers(),
                     timeout=30.0
@@ -681,9 +675,7 @@ class VapiVoiceTool(Tool):
             return self.fail_response("VAPI_PRIVATE_KEY not configured")
         
         try:
-            from core.services.supabase import DBConnection
-            db = DBConnection()
-            client = await db.client
+            client = await self.thread_manager.db.client
             
             thread_id, user_id, agent_id = await self._get_current_thread_and_user()
             
@@ -820,9 +812,7 @@ The voice call has ended. You can continue with any follow-up actions."""
         try:
             thread_id, user_id, agent_id = await self._get_current_thread_and_user()
             
-            from core.services.supabase import DBConnection
-            db = DBConnection()
-            client = await db.client
+            client = await self.thread_manager.db.client
             
             query = client.table("vapi_calls").select("*").order("created_at", desc=True).limit(limit)
             

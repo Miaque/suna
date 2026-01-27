@@ -1,4 +1,6 @@
 import json
+import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
@@ -7,6 +9,8 @@ from enum import Enum
 
 from core.services.supabase import DBConnection
 from core.utils.logger import logger
+
+MCP_CONFIG_QUERY_TIMEOUT = 10.0
 
 
 class VersionStatus(Enum):
@@ -40,7 +44,7 @@ class AgentVersion:
             'version_number': self.version_number,
             'version_name': self.version_name,
             'system_prompt': self.system_prompt,
-            'model': self.model,  # Add model to dict output
+            'model': self.model,
             'configured_mcps': self.configured_mcps,
             'custom_mcps': self.custom_mcps,
             'agentpress_tools': self.agentpress_tools,
@@ -84,59 +88,32 @@ class VersionService:
         if user_id == "system":
             return True, True
             
-        client = await self._get_client()
+        from core.versioning import repo as versioning_repo
         
-        owner_result = await client.table('agents').select('account_id').eq(
-            'agent_id', agent_id
-        ).eq('account_id', user_id).execute()
-        
-        is_owner = bool(owner_result.data)
-        
-        public_result = await client.table('agents').select('is_public').eq(
-            'agent_id', agent_id
-        ).execute()
-        
-        is_public = bool(public_result.data and public_result.data[0].get('is_public', False))
-        
-        return is_owner, is_public
+        access_info = await versioning_repo.check_agent_access(agent_id, user_id)
+        return access_info["is_owner"], access_info["is_public"]
     
     async def _get_next_version_number(self, agent_id: str) -> int:
-        client = await self._get_client()
-        
-        result = await client.table('agent_versions').select(
-            'version_number'
-        ).eq('agent_id', agent_id).order(
-            'version_number', desc=True
-        ).limit(1).execute()
-        
-        if not result.data:
-            return 1
-        
-        return result.data[0]['version_number'] + 1
+        from core.versioning import repo as versioning_repo
+        return await versioning_repo.get_next_version_number(agent_id)
     
     async def _count_versions(self, agent_id: str) -> int:
-        client = await self._get_client()
-        
-        result = await client.table('agent_versions').select(
-            'version_id', count='exact'
-        ).eq('agent_id', agent_id).execute()
-        
-        return result.count or 0
+        from core.versioning import repo as versioning_repo
+        return await versioning_repo.count_agent_versions(agent_id)
     
     async def _update_agent_current_version(self, agent_id: str, version_id: str, version_count: int):
-        client = await self._get_client()
+        from core.versioning import repo as versioning_repo
+        from core.agents import repo as agents_repo
         
-        data = {
-            'current_version_id': version_id,
-            'version_count': version_count
-        }
+        # Update agent's current version ID
+        await versioning_repo.update_agent_current_version(agent_id, version_id)
         
-        result = await client.table('agents').update(data).eq(
-            'agent_id', agent_id
-        ).execute()
+        # Update version count using agents repo (since it's in agents table)
+        await versioning_repo.update_agent_version_stats(agent_id, version_count)
         
-        if not result.data:
-            raise Exception("Failed to update agent current version")
+        from core.cache.runtime_cache import invalidate_mcp_version_config
+        await invalidate_mcp_version_config(agent_id)
+        logger.debug(f"Invalidated MCP config cache for agent {agent_id} after version update")
     
     def _version_from_db_row(self, row: Dict[str, Any]) -> AgentVersion:
         config = row.get('config', {})
@@ -202,138 +179,156 @@ class VersionService:
         if not is_owner:
             raise UnauthorizedError("Unauthorized to create version for this agent")
         
-        current_result = await client.table('agents').select('current_version_id, version_count').eq('agent_id', agent_id).single().execute()
+        from core.agents import repo as agents_repo
+        from core.versioning import repo as versioning_repo
         
-        if not current_result.data:
-            raise Exception("Worker not found")
+        agent_info = await agents_repo.get_agent_by_id(agent_id)
+        if not agent_info:
+            raise Exception("Agent not found")
+
+        previous_version_id = agent_info.get('current_version_id')
         
-        previous_version_id = current_result.data.get('current_version_id')
+        auto_generate_version_name = version_name is None
         
-        max_version_result = await client.table('agent_versions').select('version_number').eq('agent_id', agent_id).order('version_number', desc=True).limit(1).execute()
-        max_version_number = 0
-        if max_version_result.data and max_version_result.data[0].get('version_number'):
-            max_version_number = max_version_result.data[0]['version_number']
-        version_number = max_version_number + 1
-        
-        if not version_name:
-            version_name = f"v{version_number}"
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                version_number = await versioning_repo.get_next_version_number(agent_id)
                 
-        triggers_result = await client.table('agent_triggers').select('*').eq('agent_id', agent_id).execute()
-        triggers = []
-        if triggers_result.data:
-            import json
-            for trigger in triggers_result.data:
-                trigger_copy = trigger.copy()
-                if 'config' in trigger_copy and isinstance(trigger_copy['config'], str):
-                    try:
-                        trigger_copy['config'] = json.loads(trigger_copy['config'])
-                    except json.JSONDecodeError:
-                        logger.warning(f"Failed to parse trigger config for {trigger_copy.get('trigger_id')}")
-                        trigger_copy['config'] = {}
-                triggers.append(trigger_copy)
-        
-        normalized_custom_mcps = self._normalize_custom_mcps(custom_mcps)
-        
-        version = AgentVersion(
-            version_id=str(uuid4()),
-            agent_id=agent_id,
-            version_number=version_number,
-            version_name=version_name,
-            system_prompt=system_prompt,
-            model=model,
-            configured_mcps=configured_mcps,
-            custom_mcps=normalized_custom_mcps,
-            agentpress_tools=agentpress_tools,
-            is_active=True,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            created_by=user_id,
-            change_description=change_description,
-            previous_version_id=previous_version_id
-        )
-        
-        data = {
-            'version_id': version.version_id,
-            'agent_id': version.agent_id,
-            'version_number': version.version_number,
-            'version_name': version.version_name,
-            'is_active': version.is_active,
-            'created_at': version.created_at.isoformat(),
-            'updated_at': version.updated_at.isoformat(),
-            'created_by': version.created_by,
-            'change_description': version.change_description,
-            'previous_version_id': version.previous_version_id,
-            'config': {
-                'system_prompt': version.system_prompt,
-                'model': version.model,
-                'tools': {
-                    'agentpress': version.agentpress_tools,
-                    'mcp': version.configured_mcps,
-                    'custom_mcp': normalized_custom_mcps
-                },
-                'triggers': triggers
-            }
-        }
-        
-        result = await client.table('agent_versions').insert(data).execute()
-        
-        if not result.data:
-            raise Exception("Failed to create version")
-        
-        version_count = await self._count_versions(agent_id)
-        await self._update_agent_current_version(agent_id, version.version_id, version_count)
-        
-        # Invalidate agent config cache (MCPs may have changed)
-        try:
-            from core.runtime_cache import invalidate_agent_config_cache
-            await invalidate_agent_config_cache(agent_id)
-            logger.debug(f"🗑️ Invalidated cache for agent {agent_id} after version create")
-        except Exception as e:
-            logger.warning(f"Failed to invalidate cache for agent {agent_id}: {e}")
-        
-        logger.debug(f"Created version {version.version_name} for agent {agent_id}")
-        return version
+                if auto_generate_version_name:
+                    version_name = f"v{version_number}"
+                        
+                triggers = await versioning_repo.get_agent_triggers(agent_id)
+                for trigger in triggers:
+                    if 'config' in trigger and isinstance(trigger['config'], str):
+                        try:
+                            import json
+                            trigger['config'] = json.loads(trigger['config'])
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse trigger config for {trigger.get('trigger_id')}")
+                            trigger['config'] = {}
+                
+                normalized_custom_mcps = self._normalize_custom_mcps(custom_mcps)
+                
+                version = AgentVersion(
+                    version_id=str(uuid4()),
+                    agent_id=agent_id,
+                    version_number=version_number,
+                    version_name=version_name,
+                    system_prompt=system_prompt,
+                    model=model,
+                    configured_mcps=configured_mcps,
+                    custom_mcps=normalized_custom_mcps,
+                    agentpress_tools=agentpress_tools,
+                    is_active=True,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                    created_by=user_id,
+                    change_description=change_description,
+                    previous_version_id=previous_version_id
+                )
+                
+                data = {
+                    'version_id': version.version_id,
+                    'agent_id': version.agent_id,
+                    'version_number': version.version_number,
+                    'version_name': version.version_name,
+                    'is_active': version.is_active,
+                    'created_at': version.created_at.isoformat(),
+                    'updated_at': version.updated_at.isoformat(),
+                    'created_by': version.created_by,
+                    'change_description': version.change_description,
+                    'previous_version_id': version.previous_version_id,
+                    'config': {
+                        'system_prompt': version.system_prompt,
+                        'model': version.model,
+                        'tools': {
+                            'agentpress': version.agentpress_tools,
+                            'mcp': version.configured_mcps,
+                            'custom_mcp': normalized_custom_mcps
+                        },
+                        'triggers': triggers
+                    }
+                }
+                
+                from core.versioning import repo as versioning_repo
+                
+                await versioning_repo.create_agent_version_with_config(
+                    version_id=version.version_id,
+                    agent_id=version.agent_id,
+                    version_number=version.version_number,
+                    version_name=version.version_name,
+                    system_prompt=version.system_prompt,
+                    model=version.model,
+                    configured_mcps=version.configured_mcps,
+                    custom_mcps=normalized_custom_mcps,
+                    agentpress_tools=version.agentpress_tools,
+                    triggers=triggers,
+                    created_by=version.created_by,
+                    change_description=version.change_description,
+                    previous_version_id=version.previous_version_id
+                )
+                
+                version_count = await self._count_versions(agent_id)
+                await self._update_agent_current_version(agent_id, version.version_id, version_count)
+                
+                try:
+                    from core.cache.runtime_cache import invalidate_agent_config_cache
+                    await invalidate_agent_config_cache(agent_id)
+                    logger.debug(f"🗑️ Invalidated cache for agent {agent_id} after version create")
+                except Exception as e:
+                    logger.warning(f"Failed to invalidate cache for agent {agent_id}: {e}")
+                
+                logger.debug(f"Created version {version.version_name} for agent {agent_id}")
+                return version
+                
+            except Exception as e:
+                error_msg = str(e)
+                # Handle both version_number and version_name unique constraint violations
+                is_version_conflict = (
+                    "duplicate key value violates unique constraint" in error_msg and 
+                    ("agent_versions_agent_id_version_number_key" in error_msg or 
+                     "agent_versions_agent_id_version_name_key" in error_msg)
+                )
+                if is_version_conflict:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        logger.warning(f"Version conflict for agent {agent_id}, attempt {attempt + 1}/{max_retries}, retrying...")
+                        continue
+                    else:
+                        logger.error(f"Failed to create version after {max_retries} attempts due to version conflicts")
+                        raise VersionConflictError("Unable to create version due to concurrent modifications. Please try again.")
+                else:
+                    raise e
     
     async def get_version(self, agent_id: str, version_id: str, user_id: str) -> AgentVersion:
         is_owner, is_public = await self._verify_and_authorize_agent_access(agent_id, user_id)
         if not is_owner and not is_public:
             raise UnauthorizedError("You don't have permission to view this version")
         
-        client = await self._get_client()
+        from core.versioning import repo as versioning_repo
         
-        result = await client.table('agent_versions').select('*').eq(
-            'version_id', version_id
-        ).eq('agent_id', agent_id).execute()
+        result = await versioning_repo.get_agent_version_by_id(agent_id, version_id)
         
-        if not result.data:
+        if not result:
             raise VersionNotFoundError(f"Version {version_id} not found")
         
-        return self._version_from_db_row(result.data[0])
+        return self._version_from_db_row(result)
     
     async def get_active_version(self, agent_id: str, user_id: str = "system") -> Optional[AgentVersion]:
         is_owner, is_public = await self._verify_and_authorize_agent_access(agent_id, user_id)
         if not is_owner and not is_public:
             raise UnauthorizedError("You don't have permission to view this agent")
         
-        client = await self._get_client()
+        from core.versioning import repo as versioning_repo
         
-        agent_result = await client.table('agents').select('current_version_id').eq('agent_id', agent_id).execute()
-        if not agent_result.data or not agent_result.data[0].get('current_version_id'):
-            logger.warning(f"No current_version_id found for agent {agent_id}")
+        result = await versioning_repo.get_agent_current_version(agent_id)
+        
+        if not result:
+            logger.warning(f"No current version found for agent {agent_id}")
             return None
         
-        current_version_id = agent_result.data[0]['current_version_id']
-        logger.debug(f"Agent {agent_id} current_version_id: {current_version_id}")
-        
-        result = await client.table('agent_versions').select('*').eq(
-            'version_id', current_version_id
-        ).eq('agent_id', agent_id).execute()
-        
-        if not result.data:
-            logger.warning(f"Current version {current_version_id} not found for agent {agent_id}")
-            return None
-        
-        version = self._version_from_db_row(result.data[0])
+        version = self._version_from_db_row(result)
         logger.debug(f"Retrieved active version for agent {agent_id}: model='{version.model}', version_name='{version.version_name}'")
         return version
     
@@ -342,13 +337,10 @@ class VersionService:
         if not is_owner and not is_public:
             raise UnauthorizedError("You don't have permission to view versions")
         
-        client = await self._get_client()
+        from core.versioning import repo as versioning_repo
         
-        result = await client.table('agent_versions').select('*').eq(
-            'agent_id', agent_id
-        ).order('version_number', desc=True).execute()
-        
-        versions = [self._version_from_db_row(row) for row in result.data]
+        rows = await versioning_repo.get_agent_versions_list(agent_id)
+        versions = [self._version_from_db_row(row) for row in rows]
         return versions
     
     async def activate_version(self, agent_id: str, version_id: str, user_id: str) -> None:
@@ -356,40 +348,30 @@ class VersionService:
         if not is_owner:
             raise UnauthorizedError("You don't have permission to activate versions")
         
-        client = await self._get_client()
+        from core.versioning import repo as versioning_repo
         
-        version_result = await client.table('agent_versions').select('*').eq(
-            'version_id', version_id
-        ).eq('agent_id', agent_id).execute()
+        version_data = await versioning_repo.get_agent_version_by_id(agent_id, version_id)
         
-        if not version_result.data:
+        if not version_data:
             raise VersionNotFoundError(f"Version {version_id} not found")
         
-        version = version_result.data[0]
-        
-        await client.table('agent_versions').update({
-            'is_active': False,
-            'updated_at': datetime.now(timezone.utc).isoformat()
-        }).eq('agent_id', agent_id).eq('is_active', True).execute()
-        
-        await client.table('agent_versions').update({
-            'is_active': True,
-            'updated_at': datetime.now(timezone.utc).isoformat()
-        }).eq('version_id', version_id).execute()
+        # Deactivate all versions, then activate the target
+        await versioning_repo.deactivate_agent_versions(agent_id)
+        await versioning_repo.activate_agent_version(version_id)
         
         version_count = await self._count_versions(agent_id)
         await self._update_agent_current_version(agent_id, version_id, version_count)
         
         # Invalidate agent config cache (active version changed)
         try:
-            from core.runtime_cache import invalidate_agent_config_cache
+            from core.cache.runtime_cache import invalidate_agent_config_cache
             await invalidate_agent_config_cache(agent_id)
             logger.debug(f"🗑️ Invalidated cache for agent {agent_id} after version activate")
         except Exception as e:
             logger.warning(f"Failed to invalidate cache for agent {agent_id}: {e}")
         
-        logger.debug(f"Activated version {version['version_name']} for agent {agent_id}")
-    
+        logger.debug(f"Activated version {version_data['version_name']} for agent {agent_id}")
+        
     async def compare_versions(
         self,
         agent_id: str,
@@ -480,6 +462,75 @@ class VersionService:
         
         return new_version
     
+    async def get_current_mcp_config(self, agent_id: str, user_id: str = "system") -> Optional[Dict[str, Any]]:
+        import time
+        start_time = time.time()
+        
+        from core.cache.runtime_cache import (
+            get_cached_mcp_version_config,
+            set_cached_mcp_version_config
+        )
+        
+        t1 = time.time()
+        cached = await get_cached_mcp_version_config(agent_id)
+        cache_time = (time.time() - t1) * 1000
+        
+        if cached:
+            logger.debug(f"⚡ [MCP CONFIG] Cache HIT for {agent_id} in {cache_time:.1f}ms")
+            cached['account_id'] = user_id
+            return cached
+        
+        logger.debug(f"⏱️ [MCP CONFIG] Cache MISS for {agent_id}, fetching from DB (cache check: {cache_time:.1f}ms)")
+        
+        try:
+            t2 = time.time()
+            client = await self._get_client()
+            client_time = (time.time() - t2) * 1000
+            logger.debug(f"⏱️ [MCP CONFIG] DB client acquired in {client_time:.1f}ms")
+            
+            t3 = time.time()
+            rpc_result = await client.rpc('get_agent_mcp_config', {'p_agent_id': agent_id}).execute()
+            rpc_time = (time.time() - t3) * 1000
+            logger.debug(f"⏱️ [MCP CONFIG] RPC query: {rpc_time:.1f}ms")
+            
+            if not rpc_result.data:
+                logger.warning(f"⚠️ [MCP CONFIG] No config found for agent {agent_id}, using empty")
+                empty_config = {'custom_mcp': [], 'configured_mcps': [], 'account_id': user_id}
+                await set_cached_mcp_version_config(agent_id, {'custom_mcp': [], 'configured_mcps': []})
+                return empty_config
+            
+            result_data = rpc_result.data
+            if isinstance(result_data, list) and len(result_data) > 0:
+                result_data = result_data[0]
+            
+            custom_mcps = result_data.get('custom_mcp', []) if result_data else []
+            configured_mcps = result_data.get('configured_mcps', []) if result_data else []
+            
+            cache_data = {
+                'custom_mcp': custom_mcps,
+                'configured_mcps': configured_mcps,
+            }
+            
+            t4 = time.time()
+            await set_cached_mcp_version_config(agent_id, cache_data)
+            cache_set_time = (time.time() - t4) * 1000
+            
+            total_time = (time.time() - start_time) * 1000
+            logger.info(f"✅ [MCP CONFIG] Loaded for {agent_id} in {total_time:.1f}ms (client:{client_time:.0f}ms, rpc:{rpc_time:.0f}ms, cache_set:{cache_set_time:.0f}ms)")
+            
+            final_config = {
+                'custom_mcp': custom_mcps,
+                'configured_mcps': configured_mcps,
+                'account_id': user_id
+            }
+            
+            return final_config
+            
+        except Exception as e:
+            total_time = (time.time() - start_time) * 1000
+            logger.error(f"❌ [MCP CONFIG] Error loading for agent {agent_id} after {total_time:.1f}ms: {e}", exc_info=True)
+            return {'custom_mcp': [], 'configured_mcps': [], 'account_id': user_id}
+
     async def update_version_details(
         self,
         agent_id: str,

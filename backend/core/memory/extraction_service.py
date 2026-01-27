@@ -65,6 +65,11 @@ class MemoryExtractionService:
         account_id: str,
         thread_id: str
     ) -> List[ExtractedMemory]:
+        # Check global memory flag first
+        if not config.ENABLE_MEMORY:
+            logger.debug("Memory extraction skipped: ENABLE_MEMORY is False")
+            return []
+        
         try:
             logger.debug(f"Starting memory extraction for {len(messages)} messages")
             conversation_text = self._format_conversation(messages)
@@ -85,7 +90,8 @@ class MemoryExtractionService:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=2000
+                max_tokens=2000,
+                timeout=60, 
             )
             
             logger.debug(f"Got response from LLM")

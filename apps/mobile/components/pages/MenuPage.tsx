@@ -27,20 +27,19 @@ import {
 import { ConversationSection } from '@/components/menu/ConversationSection';
 import { BottomNav } from '@/components/menu/BottomNav';
 import { ProfileSection } from '@/components/menu/ProfileSection';
-import { SettingsPage } from '@/components/settings/SettingsPage';
 import { useAuthContext, useLanguage } from '@/contexts';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { AgentList } from '@/components/agents/AgentList';
+import { LibrarySection } from '@/components/agents/LibrarySection';
 import { useAgent } from '@/contexts/AgentContext';
 import { useSearch } from '@/lib/utils/search';
-import { useThreads } from '@/lib/chat';
+import { useThreads, useDeleteThread } from '@/lib/chat';
 import { useAllTriggers } from '@/lib/triggers';
-import { groupThreadsByMonth } from '@/lib/utils/thread-utils';
+import { groupThreadsByMonth, groupAgentsByTimePeriod } from '@/lib/utils/thread-utils';
 import { TriggerCreationDrawer, TriggerList } from '@/components/triggers';
 import { WorkerCreationDrawer } from '@/components/workers/WorkerCreationDrawer';
 import { WorkerConfigDrawer } from '@/components/workers/WorkerConfigDrawer';
 import { useAdvancedFeatures } from '@/hooks';
-import { AnimatedPageWrapper } from '@/components/shared/AnimatedPageWrapper';
 import type {
   Conversation,
   UserProfile,
@@ -49,7 +48,7 @@ import type {
 import type { Agent, TriggerWithAgent } from '@/api/types';
 import { ProfilePicture } from '../settings/ProfilePicture';
 import { TierBadge } from '@/components/billing/TierBadge';
-import { cn } from '@/lib/utils';
+import { log } from '@/lib/logger';
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 const AnimatedScrollView = Animated.createAnimatedComponent(ScrollView);
@@ -181,8 +180,8 @@ function BackButton({ onPress }: BackButtonProps) {
   };
 
   const handlePress = () => {
-    console.log('🎯 Close button pressed');
-    console.log('📱 Returning to Home');
+    log.log('🎯 Close button pressed');
+    log.log('📱 Returning to Home');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     onPress?.();
   };
@@ -231,92 +230,6 @@ function NewChatButton({ onPress }: NewChatButtonProps) {
       className="h-14 w-full flex-row items-center justify-center gap-2 rounded-2xl bg-primary">
       <Icon as={Plus} size={20} strokeWidth={2} className="text-primary-foreground" />
       <Text className="font-roobert-medium text-primary-foreground">{t('menu.newChat')}</Text>
-    </AnimatedPressable>
-  );
-}
-
-interface FloatingActionButtonProps {
-  activeTab: 'chats' | 'workers' | 'triggers';
-  onChatPress?: () => void;
-  onWorkerPress?: () => void;
-  onTriggerPress?: () => void;
-}
-
-function FloatingActionButton({
-  activeTab,
-  onChatPress,
-  onWorkerPress,
-  onTriggerPress,
-}: FloatingActionButtonProps) {
-  const { t } = useLanguage();
-  const { colorScheme } = useColorScheme();
-  const { isEnabled: advancedFeaturesEnabled } = useAdvancedFeatures();
-  const scale = useSharedValue(1);
-  const rotate = useSharedValue(0);
-
-  const animatedStyle = useAnimatedStyle(() => ({
-    transform: [{ scale: scale.value }, { rotate: `${rotate.value}deg` }],
-  }));
-
-  const handlePressIn = () => {
-    scale.value = withSpring(0.9, { damping: 15, stiffness: 400 });
-  };
-
-  const handlePressOut = () => {
-    scale.value = withSpring(1, { damping: 15, stiffness: 400 });
-  };
-
-  const handlePress = () => {
-    const action =
-      activeTab === 'chats'
-        ? t('menu.newChat')
-        : activeTab === 'workers'
-          ? t('menu.newWorker')
-          : t('menu.newTrigger');
-    console.log('🎯 FAB pressed:', action);
-    console.log('⏰ Timestamp:', new Date().toISOString());
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-
-    rotate.value = withSpring(rotate.value + 90, { damping: 15, stiffness: 400 });
-
-    if (activeTab === 'chats') onChatPress?.();
-    else if (activeTab === 'workers') onWorkerPress?.();
-    else if (activeTab === 'triggers') onTriggerPress?.();
-  };
-
-  const getAccessibilityLabel = () => {
-    const item = activeTab === 'chats' ? 'chat' : activeTab === 'workers' ? 'worker' : 'trigger';
-    return t('actions.createNew', { item });
-  };
-
-  const bgColor = colorScheme === 'dark' ? '#FFFFFF' : '#121215';
-  const iconColor = colorScheme === 'dark' ? '#121215' : '#FFFFFF';
-
-  return (
-    <AnimatedPressable
-      onPress={handlePress}
-      onPressIn={handlePressIn}
-      onPressOut={handlePressOut}
-      style={[
-        animatedStyle,
-        {
-          width: 60,
-          height: 60,
-          backgroundColor: bgColor,
-          shadowColor: '#000',
-          shadowOffset: { width: 0, height: 6 },
-          shadowOpacity: 0.25,
-          shadowRadius: 12,
-          elevation: 10,
-        },
-      ]}
-      className={cn(
-        'absolute bottom-44 right-6 items-center justify-center rounded-full',
-        advancedFeaturesEnabled ? 'bottom-[230px]' : 'bottom-34'
-      )}
-      accessibilityRole="button"
-      accessibilityLabel={getAccessibilityLabel()}>
-      <Icon as={Plus} size={26} color={iconColor} strokeWidth={2.5} />
     </AnimatedPressable>
   );
 }
@@ -385,7 +298,7 @@ export function MenuPage({
   workerConfigInitialView,
   onCloseWorkerConfigDrawer,
 }: MenuPageProps) {
-  const { t } = useLanguage();
+  const { t, currentLanguage } = useLanguage();
   const { colorScheme } = useColorScheme();
   const { user } = useAuthContext();
   const router = useRouter();
@@ -394,19 +307,31 @@ export function MenuPage({
   const insets = useSafeAreaInsets();
   const scrollY = useSharedValue(0);
   const profileScale = useSharedValue(1);
-  const [isSettingsVisible, setIsSettingsVisible] = React.useState(false);
   const [isTriggerDrawerVisible, setIsTriggerDrawerVisible] = React.useState(false);
   const [isWorkerCreationDrawerVisible, setIsWorkerCreationDrawerVisible] = React.useState(false);
 
   // Debug trigger drawer visibility
   React.useEffect(() => {
-    console.log('🔧 TriggerCreationDrawer visible changed to:', isTriggerDrawerVisible);
+    log.log('🔧 TriggerCreationDrawer visible changed to:', isTriggerDrawerVisible);
   }, [isTriggerDrawerVisible]);
 
   const isGuest = !user;
 
   // Fetch real threads from backend
-  const { data: threads = [], isLoading: isLoadingThreads, error: threadsError } = useThreads();
+  const { data: threads = [], isLoading: isLoadingThreads, error: threadsError, refetch: refetchThreads } = useThreads();
+
+  // Refetch threads when drawer opens/gains focus
+  useFocusEffect(
+    React.useCallback(() => {
+      refetchThreads();
+    }, [refetchThreads])
+  );
+
+  // Delete thread mutation
+  const deleteThreadMutation = useDeleteThread();
+
+  // Track which conversation is being deleted
+  const [deletingConversationId, setDeletingConversationId] = React.useState<string | null>(null);
 
   // Transform threads to sections
   const sections = React.useMemo(() => {
@@ -484,6 +409,22 @@ export function MenuPage({
   }, [activeTab]);
 
   /**
+   * Handle conversation delete
+   */
+  const handleConversationDelete = React.useCallback(async (conversation: Conversation) => {
+    log.log('🗑️ Deleting conversation:', conversation.id);
+    setDeletingConversationId(conversation.id);
+    try {
+      await deleteThreadMutation.mutateAsync(conversation.id);
+      log.log('✅ Conversation deleted successfully');
+    } catch (error) {
+      log.error('❌ Failed to delete conversation:', error);
+    } finally {
+      setDeletingConversationId(null);
+    }
+  }, [deleteThreadMutation]);
+
+  /**
    * Handle scroll event to track scroll position
    * Used for blur fade effect at bottom
    */
@@ -497,12 +438,12 @@ export function MenuPage({
   }));
 
   /**
-   * Handle profile press - Opens settings drawer
+   * Handle profile press - Navigate to settings
    */
   const handleProfilePress = () => {
-    console.log('🎯 Opening settings drawer');
+    log.log('🎯 Navigating to settings');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setIsSettingsVisible(true);
+    router.push('/(settings)');
   };
 
   const handleProfilePressIn = () => {
@@ -514,21 +455,13 @@ export function MenuPage({
   };
 
   /**
-   * Handle settings drawer close
-   */
-  const handleCloseSettings = () => {
-    console.log('🎯 Closing settings drawer');
-    setIsSettingsVisible(false);
-  };
-
-  /**
    * Handle trigger creation
    */
   const handleTriggerCreate = () => {
-    console.log('🔧 Opening trigger creation drawer');
-    console.log('🔧 Current isTriggerDrawerVisible:', isTriggerDrawerVisible);
+    log.log('🔧 Opening trigger creation drawer');
+    log.log('🔧 Current isTriggerDrawerVisible:', isTriggerDrawerVisible);
     setIsTriggerDrawerVisible(true);
-    console.log('🔧 Set isTriggerDrawerVisible to true');
+    log.log('🔧 Set isTriggerDrawerVisible to true');
   };
 
   /**
@@ -542,7 +475,7 @@ export function MenuPage({
    * Handle trigger created
    */
   const handleTriggerCreated = (triggerId: string) => {
-    console.log('🔧 Trigger created:', triggerId);
+    log.log('🔧 Trigger created:', triggerId);
     setIsTriggerDrawerVisible(false);
     // Refetch triggers to show the new one
     refetchTriggers();
@@ -552,7 +485,7 @@ export function MenuPage({
    * Handle worker creation
    */
   const handleWorkerCreate = () => {
-    console.log('🤖 Opening worker creation drawer');
+    log.log('🤖 Opening worker creation drawer');
     setIsWorkerCreationDrawerVisible(true);
   };
 
@@ -567,7 +500,7 @@ export function MenuPage({
    * Handle worker created
    */
   const handleWorkerCreated = (workerId: string) => {
-    console.log('🤖 Worker created:', workerId);
+    log.log('🤖 Worker created:', workerId);
     setIsWorkerCreationDrawerVisible(false);
     // Navigate to config page for the new worker
     router.push({
@@ -580,7 +513,7 @@ export function MenuPage({
    * Handle worker press - navigates to config page
    */
   const handleWorkerPress = (agent: Agent) => {
-    console.log('🤖 Opening worker config for:', agent.agent_id);
+    log.log('🤖 Opening worker config for:', agent.agent_id);
     router.push({
       pathname: '/worker-config',
       params: { workerId: agent.agent_id },
@@ -708,6 +641,8 @@ export function MenuPage({
                               conversations: filteredConversations,
                             }}
                             onConversationPress={onConversationPress}
+                            onConversationDelete={handleConversationDelete}
+                            deletingConversationId={deletingConversationId}
                           />
                         );
                       })}
@@ -757,13 +692,30 @@ export function MenuPage({
                       }
                     />
                   ) : (
-                    <AgentList
-                      agents={agentResults}
-                      selectedAgentId={selectedAgentId}
-                      onAgentPress={handleWorkerPress}
-                      showChevron={false}
-                      compact={false}
-                    />
+                    <View className="gap-8">
+                      {groupAgentsByTimePeriod(agentResults, currentLanguage).map((section) => {
+                        // Filter agents in section based on search
+                        const filteredAgents = workersSearch.isSearching
+                          ? section.agents.filter((agent) =>
+                              workersSearch.results.some((result) => result.id === agent.agent_id)
+                            )
+                          : section.agents;
+
+                        if (filteredAgents.length === 0 && workersSearch.isSearching) {
+                          return null;
+                        }
+
+                        return (
+                          <LibrarySection
+                            key={section.id}
+                            label={section.label}
+                            agents={filteredAgents}
+                            selectedAgentId={selectedAgentId}
+                            onAgentPress={handleWorkerPress}
+                          />
+                        );
+                      })}
+                    </View>
                   )}
                 </>
               )}
@@ -812,7 +764,7 @@ export function MenuPage({
                       error={triggersError}
                       searchQuery={triggersSearch.query}
                       onTriggerPress={(selectedTrigger) => {
-                        console.log('🔧 Trigger selected:', selectedTrigger.name);
+                        log.log('🔧 Trigger selected:', selectedTrigger.name);
                         // Navigate to trigger detail page
                         router.push({
                           pathname: '/trigger-detail',
@@ -903,21 +855,6 @@ export function MenuPage({
           )}
         </View>
       </SafeAreaView>
-
-      {/* Settings Page */}
-      <AnimatedPageWrapper visible={isSettingsVisible} onClose={handleCloseSettings}>
-        <SettingsPage visible={isSettingsVisible} profile={profile} onClose={handleCloseSettings} />
-      </AnimatedPageWrapper>
-
-      {/* Floating Action Button */}
-      {advancedFeaturesEnabled && (
-        <FloatingActionButton
-          activeTab={activeTab}
-          onChatPress={onNewChat}
-          onWorkerPress={handleWorkerCreate}
-          onTriggerPress={handleTriggerCreate}
-        />
-      )}
 
       {isTriggerDrawerVisible && (
         <TriggerCreationDrawer

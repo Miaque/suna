@@ -25,6 +25,32 @@ class MCPJITLoader:
         self._initialized = False
         self._tool_map_built = False
     
+    async def rebuild_tool_map(self, fresh_config: Dict[str, Any]) -> None:
+        custom_mcps_plural = fresh_config.get('custom_mcps', [])
+        custom_mcp_singular = fresh_config.get('custom_mcp', [])
+        configured_mcps = fresh_config.get('configured_mcps', [])
+        
+        old_tools = list(self.tool_map.keys())
+        old_agent_config = dict(self.agent_config)
+        
+        normalized_fresh_config = {
+            'custom_mcp': custom_mcp_singular or custom_mcps_plural,
+            'configured_mcps': configured_mcps,
+            'account_id': fresh_config.get('account_id', old_agent_config.get('account_id'))
+        }
+        
+        self.agent_config.update(normalized_fresh_config)
+        
+        # Clear existing tool map
+        self.tool_map.clear()
+        self._tool_map_built = False
+        
+        # Rebuild with fresh config
+        await self.build_tool_map(cache_only=False, force_rebuild=True)
+        
+        new_tools = list(self.tool_map.keys())
+        logger.debug(f"⚡ [MCP JIT] Rebuilt tool map: {len(new_tools)} tools loaded")
+
     async def build_tool_map(self, cache_only: bool = False, force_rebuild: bool = False) -> None:
         if self._tool_map_built and not force_rebuild and cache_only:
             logger.debug("⚡ [MCP JIT] Tool map already built, skipping")
@@ -80,37 +106,34 @@ class MCPJITLoader:
         
         toolkit_slug = self._extract_toolkit_slug(mcp_config)
         
-        logger.debug(f"⚡ [MCP JIT] Processing {config_type} MCP: {server_name} -> toolkit_slug={toolkit_slug}")
-        
         if not toolkit_slug:
-            logger.warning(f"⚠️  [MCP JIT] No toolkit_slug found in {config_type} MCP config: {mcp_config}")
-            return
-
-        account_id = self.agent_config.get('account_id')
-        logger.debug(f"⚡ [MCP JIT] Querying tools for {toolkit_slug} (cache_only={cache_only}, account_id={account_id})")
-        
-        available_tools = await get_toolkit_tools(toolkit_slug, account_id=account_id, cache_only=cache_only)
-        
-        logger.debug(f"⚡ [MCP JIT] Got {len(available_tools)} tools for {toolkit_slug}")
-        
-        if not available_tools:
-            if cache_only:
-                logger.debug(f"⚡ [MCP JIT] No cached tools for {toolkit_slug} - will discover in enrichment")
-            else:
-                logger.warning(f"⚠️  [MCP JIT] No tools found for toolkit: {toolkit_slug}")
+            logger.warning(f"⚠️  [MCP JIT] No toolkit_slug found in {config_type} MCP config")
             return
 
         enabled_tools = mcp_config.get('enabledTools', [])
-        if enabled_tools:
-            tools_to_add = [tool for tool in available_tools if tool in enabled_tools]
-            logger.debug(f"⚡ [MCP JIT] {toolkit_slug}: Filtered to {len(tools_to_add)}/{len(available_tools)} enabled tools")
-        else:
-            tools_to_add = available_tools
-            logger.debug(f"⚡ [MCP JIT] {toolkit_slug}: No enabledTools filter, loading all {len(tools_to_add)} tools")
         
-        for tool_name in tools_to_add:
+        if enabled_tools:
+            for tool_name in enabled_tools:
+                if tool_name in self.tool_map:
+                    continue
+                
+                self.tool_map[tool_name] = MCPToolInfo(
+                    tool_name=tool_name,
+                    toolkit_slug=toolkit_slug,
+                    mcp_config=mcp_config
+                )
+            return
+        
+        account_id = self.agent_config.get('account_id')
+        available_tools = await get_toolkit_tools(toolkit_slug, account_id=account_id, cache_only=cache_only)
+        
+        if not available_tools:
+            if not cache_only:
+                logger.warning(f"⚠️  [MCP JIT] No tools found for toolkit: {toolkit_slug}")
+            return
+        
+        for tool_name in available_tools:
             if tool_name in self.tool_map:
-                logger.warning(f"⚠️  [MCP JIT] Tool '{tool_name}' already registered, skipping duplicate")
                 continue
             
             self.tool_map[tool_name] = MCPToolInfo(

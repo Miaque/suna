@@ -5,7 +5,7 @@ on:
     branches:
       - main      # Staging environment → main EAS branch/channel
       - staging   # Staging environment → main EAS branch/channel
-      - PRODUCTION # Production environment → production EAS branch/channel
+      # PRODUCTION requires manual trigger via workflow_dispatch
     paths:
       - 'apps/mobile/**'
       - '.github/workflows/mobile-eas-update.yml'
@@ -53,8 +53,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: apps/mobile/package-lock.json
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
       - name: Setup EAS CLI
         uses: expo/expo-github-action@v8
@@ -64,8 +67,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: apps/mobile
-        run: |
-          npm install --package-lock-only || npm install
+        run: pnpm install
 
       - name: Get branch name
         id: branch
@@ -166,9 +168,9 @@ jobs:
             echo "environment=production" >> $GITHUB_OUTPUT
           else
             # Staging environment for main and staging branches
-            echo "EXPO_PUBLIC_SUPABASE_URL=https://heprlhlltebrxydgtsjs.supabase.co" >> $GITHUB_ENV
-            echo "EXPO_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhlcHJsaGxsdGVicnh5ZGd0c2pzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDUxODcxNjQsImV4cCI6MjA2MDc2MzE2NH0.YRo1iZw06YSxqBhotBnD1d5jZxw7hHwswe1wKp8VpfA" >> $GITHUB_ENV
-            echo "EXPO_PUBLIC_BACKEND_URL=https://staging-api.suna.so/v1" >> $GITHUB_ENV
+            echo "EXPO_PUBLIC_SUPABASE_URL=https://ujzsbwvurfyeuerxxeaz.supabase.co" >> $GITHUB_ENV
+            echo "EXPO_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVqenNid3Z1cmZ5ZXVlcnh4ZWF6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg5MDQwMzUsImV4cCI6MjA4NDQ4MDAzNX0.-yXpKNQphoh5F4MSPxVkW1P63Ow7jZvHgFppS2KMfWc" >> $GITHUB_ENV
+            echo "EXPO_PUBLIC_BACKEND_URL=https://staging-api.kortix.com/v1" >> $GITHUB_ENV
             echo "environment=staging" >> $GITHUB_OUTPUT
           fi
 

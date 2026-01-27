@@ -1,95 +1,102 @@
 from tavily import AsyncTavilyClient
-import httpx
 from dotenv import load_dotenv
 from core.agentpress.tool import Tool, ToolResult, openapi_schema, tool_metadata
 from core.utils.config import config
 from core.sandbox.tool_base import SandboxToolsBase
 from core.agentpress.thread_manager import ThreadManager
+from core.services.http_client import get_http_client
 import json
 import datetime
 import asyncio
 import logging
 import time
+import base64
+import replicate
+import httpx
 
 # TODO: add subpages, etc... in filters as sometimes its necessary 
 
 @tool_metadata(
-    display_name="Web Search",
-    description="Search the internet for information, news, and research",
+    display_name="WebSearch",
+    description="Search the web and use the results to inform responses with up-to-date information",
     icon="Search",
     color="bg-green-100 dark:bg-green-800/50",
     weight=30,
     visible=True,
     usage_guide="""
-### WEB SEARCH & CONTENT EXTRACTION
+## WebSearch - Search the web for current information
 
-**WEB SEARCH CAPABILITIES:**
-- Search the web for up-to-date information with direct question answering
-- **BATCH SEARCHING:** Execute multiple queries concurrently for faster research - provide an array of queries to search multiple topics simultaneously
-- Retrieve relevant images related to search queries
-- Get comprehensive search results with titles, URLs, and snippets
-- Find recent news, articles, and information beyond training data
-- Scrape webpage content for detailed information extraction when needed
+Allows searching the web and using the results to inform responses. Provides up-to-date information for current events and recent data.
 
-**RESEARCH BEST PRACTICES:**
-1. **Multi-source approach for thorough research:**
-   - Start with web-search using BATCH MODE (multiple queries concurrently) to find direct answers, images, and relevant URLs efficiently
-   - ALWAYS use web_search with multiple queries in batch mode when researching multiple aspects of a topic
-   - **AUTOMATICALLY identify and scrape qualitative sources** (papers, articles, detailed content) from search results
-   - Only use browser tools when scrape-webpage fails or interaction is needed
+### Available Tools
+- **web_search**: Search the web with single or BATCH queries
+- **scrape_webpage** (WebFetch): Extract full content from web pages
 
-2. **Research Workflow with Automatic Content Extraction:**
-   - **MANDATORY**: Use web-search in BATCH MODE with multiple queries for direct answers and URLs
-   - **CRITICAL**: When researching any topic with multiple dimensions, ALWAYS use batch mode
-   - **CORRECT FORMAT**: use web_search with query parameter containing multiple queries (e.g., topic overview, use cases, pricing) and num_results set to 5
-   - **WRONG FORMAT**: Never pass query as a JSON string - use native array format
-   - Example: use web_search with query parameter containing multiple queries (topic overview, use cases, pricing, user demographics) and num_results 5 - runs all searches in parallel
-   - **AUTOMATIC CONTENT EXTRACTION**: After web_search, automatically identify qualitative sources:
-     * Academic papers (arxiv.org, pubmed, Semantic Scholar, etc.) → Use get_paper_details for papers with paper IDs
-     * Long-form articles, research reports, detailed content → Use scrape-webpage to extract full content
-     * Collect multiple qualitative URLs and scrape them in batch for efficiency
-   - **MANDATORY**: Never rely solely on search snippets - always extract and read full content from qualitative sources
-   - Only if scrape-webpage fails or interaction required: use browser automation tools
+### When to Use
+- Accessing information beyond the knowledge cutoff
+- Finding current information, news, recent events
+- Researching topics that require up-to-date data
+- Gathering information from multiple sources
+- Fact-checking or verifying claims
 
-**WEB SEARCH BEST PRACTICES:**
-- **BATCH SEARCHING FOR EFFICIENCY:** Use batch mode by providing multiple queries to execute searches concurrently
-- **CRITICAL FORMAT REQUIREMENTS:**
-  * Single query: use web_search with query parameter "Tesla news" and num_results 5
-  * Batch queries: use web_search with query parameter containing multiple queries (Tesla news, Tesla stock, Tesla products) and num_results 5
-  * The query parameter MUST be a native array, NOT a JSON string
-  * num_results MUST be an integer, NOT a string
-- **WHEN TO USE BATCH MODE:** Researching multiple related topics, gathering comprehensive information, parallel searches
-- **WHEN TO USE SINGLE QUERY MODE:** Simple focused searches, follow-up searches, iterative refinement
-- Use specific, targeted questions to get direct answers
-- Include key terms and contextual information in search queries
-- Filter search results by date when freshness is important
-- Review the direct answer, images, and search results
-- Analyze multiple search results to cross-validate information
+### When NOT to Use
+- For information already in the conversation context
+- When the user provides all necessary information
+- For simple calculations or logic that doesn't need external data
 
-**CONTENT EXTRACTION DECISION TREE:**
-1. ALWAYS start with web-search using BATCH MODE to get direct answers and search results
-2. **AUTOMATICALLY identify qualitative sources** from search results:
-   - Academic papers (arxiv.org, pubmed, Semantic Scholar, IEEE, ACM, Nature, Science, etc.)
-   - Long-form articles, research reports, detailed blog posts
-   - Documentation pages, guides, whitepapers
-   - Any source with substantial qualitative content
-3. **AUTOMATICALLY extract content** from identified qualitative sources:
-   - For Semantic Scholar papers: Use get_paper_details with paper_id (extract from URL or search result)
-   - For other papers/articles: Use scrape-webpage to get full content
-   - Batch scrape multiple URLs together for efficiency
-4. **MANDATORY**: Read extracted content thoroughly - don't rely on search snippets alone
-5. Only skip scraping if web-search already provides complete answers AND no qualitative sources are present
-6. Only use browser tools if scrape-webpage fails or interaction is required
+### ⚠️ DO NOT OVERRIDE BROWSER-EXTRACTED DATA
+- If you already visited a SPECIFIC website with browser_tool and extracted content from it, that extracted content is your **PRIMARY SOURCE**
+- Web search results should NOT override or replace information you extracted directly from the target website
+- Use web search only for ADDITIONAL context (reviews, news, competitor comparisons) - NOT to replace first-hand data
+- Example: If user asks "create slides for magicterms.com" and you already browsed/extracted from magicterms.com, USE that extracted data - don't do web searches that might return info about OTHER similar websites
 
-**DATA FRESHNESS:**
-- Always check publication dates of search results
-- Prioritize recent sources for time-sensitive information
-- Use date filters to ensure information relevance
-- Provide timestamp context when sharing web search information
-- Specify date ranges when searching for time-sensitive topics
+### CRITICAL REQUIREMENT - Sources
 
-**TIME CONTEXT FOR RESEARCH:**
-- CRITICAL: When searching for latest news or time-sensitive information, ALWAYS use the current date/time values provided at runtime as reference points
+After answering the user's question, you MUST include a "Sources:" section at the end of your response listing all relevant URLs from the search results as markdown hyperlinks.
+
+Example format:
+```
+[Your answer here]
+
+Sources:
+- [Source Title 1](https://example.com/1)
+- [Source Title 2](https://example.com/2)
+```
+
+### Batch Mode
+
+**ALWAYS batch multiple queries into ONE call for efficiency:**
+- ❌ WRONG: 3 separate web_search calls
+- ✅ CORRECT: ONE call with query=["topic 1", "topic 2", "topic 3"]
+
+### Usage Pattern
+
+```
+# Correct - batch all queries
+web_search(query=["Tesla news 2025", "Tesla stock", "Tesla products"], num_results=5)
+
+# Wrong - never do this
+web_search(query="Tesla news")
+web_search(query="Tesla stock")  # Wasteful!
+```
+
+### Search Query Best Practice
+
+IMPORTANT: Use the correct year in search queries. When searching for recent information, documentation, or current events, use the current year (2025+) rather than previous years.
+
+### Content Extraction (WebFetch)
+
+Use scrape_webpage to fetch and analyze web content:
+- Fetches URL content and converts HTML to markdown
+- Use a prompt to describe what information you want to extract
+- For GitHub URLs, prefer using the gh CLI via Bash instead
+
+### Important Notes
+- query parameter: native array ["q1", "q2"], NOT JSON string
+- num_results: integer (5), NOT string ("5")
+- Check publication dates for time-sensitive info
+- Cross-validate information across multiple sources
+- Domain filtering is supported to include or block specific websites
 """
 )
 class SandboxWebSearchTool(SandboxToolsBase):
@@ -116,7 +123,18 @@ class SandboxWebSearchTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for up-to-date information using the Tavily API. IMPORTANT: For batch searches, pass query as a native array of strings, NOT as a JSON string. For num_results, pass an integer, NOT a string. This tool supports both single and batch queries for efficient research. You can search for multiple topics simultaneously by providing multiple queries as an array, which executes searches concurrently for faster results. Use batch mode when researching multiple related topics, gathering comprehensive information, or performing parallel searches. Results include titles, URLs, publication dates, direct answers, and images. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `query` (REQUIRED), `num_results` (optional).",
+            "description": """Search the web for up-to-date information.
+
+Allows searching the web and using the results to inform responses. Provides up-to-date information for current events and recent data. Returns search results including titles, URLs, publication dates, direct answers, and images.
+
+CRITICAL REQUIREMENT - After answering the user's question, you MUST include a "Sources:" section listing all relevant URLs from the search results as markdown hyperlinks: [Title](URL)
+
+Usage notes:
+- Supports both single queries and batch queries (array) for concurrent execution
+- Domain filtering is supported to include or block specific websites
+- IMPORTANT: Use the current year in search queries when searching for recent information
+
+IMPORTANT: For batch searches, pass query as a native array of strings, NOT as a JSON string.""",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -124,21 +142,21 @@ class SandboxWebSearchTool(SandboxToolsBase):
                         "oneOf": [
                             {
                                 "type": "string",
-                                "description": "**REQUIRED** - A single search query to find relevant web pages. Be specific and include key terms to improve search accuracy. For best results, use natural language questions or keyword combinations that precisely describe what you're looking for. Example: \"Tesla latest news 2025\""
+                                "description": "A single search query to find relevant web pages."
                             },
                             {
                                 "type": "array",
                                 "items": {
                                     "type": "string"
                                 },
-                                "description": "**REQUIRED** - Multiple search queries to execute concurrently. CRITICAL: Pass as a native array of strings, NOT as a JSON string. Use this for batch searching when you need to research multiple related topics simultaneously. Each query will be processed in parallel for faster results. Example: [\"Tesla news\", \"Tesla stock price\", \"Tesla products\"]"
+                                "description": "Multiple search queries to execute concurrently. Pass as a native array of strings, NOT as a JSON string."
                             }
                         ],
-                        "description": "**REQUIRED** - Either a single search query (string) or multiple queries (NATIVE array of strings, NOT JSON string) to execute concurrently. For batch mode, provide multiple queries as an array, NOT as a JSON string."
+                        "description": "**REQUIRED** - The search query to use. Either a single query (string) or multiple queries (array) to execute concurrently."
                     },
                     "num_results": {
                         "type": "integer",
-                        "description": "**OPTIONAL** - The number of search results to return per query (1-50). MUST be a native integer like 5, NOT a string like \"5\". Increase for more comprehensive research or decrease for focused, high-relevance results. Applies to each query when using batch mode. Default: 5.",
+                        "description": "**OPTIONAL** - Number of search results to return per query (1-50). Default: 5.",
                         "default": 5
                     }
                 },
@@ -209,6 +227,7 @@ class SandboxWebSearchTool(SandboxToolsBase):
                 batch_response = {
                     "batch_mode": True,
                     "total_queries": len(queries),
+                    "elapsed_time": round(elapsed_time, 2),
                     "results": []
                 }
                 
@@ -243,7 +262,6 @@ class SandboxWebSearchTool(SandboxToolsBase):
                     output=json.dumps(batch_response, ensure_ascii=False)
                 )
             else:
-                # Single query mode: original behavior
                 if not query or not isinstance(query, str):
                     return self.fail_response("A valid search query is required.")
                 
@@ -252,18 +270,23 @@ class SandboxWebSearchTool(SandboxToolsBase):
                     return self.fail_response("A valid search query is required.")
                 
                 logging.info(f"Executing web search for query: '{query}' with {num_results} results")
+                start_time = time.time()
                 result = await self._execute_single_search(query, num_results)
+                elapsed_time = time.time() - start_time
+                
+                response = result.get("response", {})
+                response["elapsed_time"] = round(elapsed_time, 2)
                 
                 if result.get("success", False):
                     return ToolResult(
                         success=True,
-                        output=json.dumps(result.get("response", {}), ensure_ascii=False)
+                        output=json.dumps(response, ensure_ascii=False)
                     )
                 else:
                     logging.warning(f"No search results or answer found for query: '{query}'")
                     return ToolResult(
                         success=False,
-                        output=json.dumps(result.get("response", {}), ensure_ascii=False)
+                        output=json.dumps(response, ensure_ascii=False)
                     )
         
         except Exception as e:
@@ -284,7 +307,7 @@ class SandboxWebSearchTool(SandboxToolsBase):
         - num_results: Number of results to return
         
         Returns:
-        - dict with success status, results, answer, images, and full response
+        - dict with success status, results, answer, images (with OCR & dimensions), and full response
         """
         try:
             search_response = await self.tavily_client.search(
@@ -298,19 +321,26 @@ class SandboxWebSearchTool(SandboxToolsBase):
             # Extract results and answer
             results = search_response.get('results', [])
             answer = search_response.get('answer', '')
-            images = search_response.get('images', [])
+            raw_images = search_response.get('images', [])
+            
+            # Enrich images with OCR and dimensions
+            enriched_images = await self._enrich_images_with_metadata(raw_images)
             
             # Consider search successful if we have either results OR an answer
             success = len(results) > 0 or (answer and answer.strip())
             
-            logging.info(f"Retrieved search results for query: '{query}' - {len(results)} results, answer: {'yes' if answer else 'no'}")
+            logging.info(f"Retrieved search results for query: '{query}' - {len(results)} results, answer: {'yes' if answer else 'no'}, {len(enriched_images)} images enriched")
+            
+            # Update search_response with enriched images
+            enriched_response = dict(search_response)
+            enriched_response['images'] = enriched_images
             
             return {
                 "success": success,
                 "results": results,
                 "answer": answer,
-                "images": images,
-                "response": search_response
+                "images": enriched_images,
+                "response": enriched_response
             }
         
         except Exception as e:
@@ -325,21 +355,191 @@ class SandboxWebSearchTool(SandboxToolsBase):
                 "error": error_message
             }
 
+    async def _enrich_images_with_metadata(self, images: list) -> list:
+        """
+        Enrich image URLs with OCR text and dimensions.
+        Downloads all images and runs OCR IN PARALLEL for speed.
+        
+        Args:
+            images: List of image URLs (strings) or image objects from Tavily
+            
+        Returns:
+            List of enriched image objects with url, width, height, and description
+        """
+        if not images:
+            return []
+        
+        # Collect valid image URLs
+        valid_images = []
+        for img in images:
+            if isinstance(img, str):
+                img_url = img
+            elif isinstance(img, dict):
+                img_url = img.get('url', '')
+            else:
+                continue
+            
+            if img_url:
+                valid_images.append(img_url)
+        
+        if not valid_images:
+            return []
+        
+        logging.info(f"[WebSearch] Starting parallel image enrichment for {len(valid_images)} images")
+        
+        # Process all images in parallel
+        async with get_http_client() as client:
+            tasks = [self._enrich_single_image(img_url, client) for img_url in valid_images]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Collect results, handling any exceptions
+        enriched = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logging.debug(f"[WebSearch] Error enriching image {i}: {result}")
+                enriched.append({
+                    "url": valid_images[i],
+                    "width": 0,
+                    "height": 0,
+                    "description": ""
+                })
+            else:
+                enriched.append(result)
+        
+        logging.info(f"[WebSearch] Completed parallel enrichment for {len(enriched)} images")
+        return enriched
+    
+    async def _enrich_single_image(self, img_url: str, client) -> dict:
+        """
+        Download and enrich a single image with dimensions and description.
+        Uses Moondream2 vision model for image understanding.
+        
+        Args:
+            img_url: URL of the image
+            client: HTTP client for downloading
+            
+        Returns:
+            Enriched image data dict
+        """
+        image_data = {
+            "url": img_url,
+            "width": 0,
+            "height": 0,
+            "description": ""
+        }
+        
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            response = await client.get(img_url, headers=headers, timeout=15.0, follow_redirects=True)
+            
+            if response.status_code == 200:
+                image_bytes = response.content
+                content_type = response.headers.get("content-type", "")
+                
+                if content_type.startswith("image/"):
+                    # Get dimensions using PIL
+                    try:
+                        from PIL import Image
+                        from io import BytesIO
+                        img_pil = Image.open(BytesIO(image_bytes))
+                        image_data["width"] = img_pil.width
+                        image_data["height"] = img_pil.height
+                        logging.debug(f"[WebSearch] Image dimensions: {img_pil.width}x{img_pil.height}")
+                    except Exception as dim_err:
+                        logging.debug(f"[WebSearch] Could not get dimensions: {dim_err}")
+                    
+                    # Get image description using Moondream2
+                    description = await self._describe_image(image_bytes, content_type)
+                    image_data["description"] = description
+        
+        except Exception as e:
+            logging.debug(f"[WebSearch] Error enriching image {img_url[:50]}...: {str(e)[:100]}")
+        
+        return image_data
+    
+    async def _describe_image(self, image_bytes: bytes, content_type: str) -> str:
+        """
+        Get image description using Moondream2 vision model.
+        Runs in ~2 seconds on Replicate GPU, includes text extraction.
+        Skipped if REPLICATE_API_TOKEN is not configured.
+        
+        Args:
+            image_bytes: Raw image bytes
+            content_type: MIME type of the image
+            
+        Returns:
+            Image description, or empty string if processing fails or token not configured
+        """
+        try:
+            # Skip if Replicate token not configured
+            from core.utils.config import get_config
+            replicate_token = get_config().REPLICATE_API_TOKEN
+            if not replicate_token:
+                logging.debug("[WebSearch] Skipping Moondream2: REPLICATE_API_TOKEN not configured")
+                return ""
+            
+            import os
+            os.environ["REPLICATE_API_TOKEN"] = replicate_token
+            
+            logging.debug(f"[WebSearch] Running Moondream2 on image ({len(image_bytes)} bytes)")
+            
+            # Convert to base64 data URL
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            data_url = f"data:{content_type};base64,{image_b64}"
+            
+            # Call Moondream2 vision model
+            def run_moondream(data_url: str) -> str:
+                output = replicate.run(
+                    "lucataco/moondream2:72ccb656353c348c1385df54b237eeb7bfa874bf11486cf0b9473e691b662d31",
+                    input={
+                        "image": data_url,
+                        "prompt": "Describe this image in detail. Include any text visible in the image."
+                    }
+                )
+                # Output is a generator, consume it to get the full text
+                if hasattr(output, '__iter__') and not isinstance(output, (str, bytes)):
+                    return "".join(str(chunk) for chunk in output)
+                return str(output) if output else ""
+            
+            description = await asyncio.to_thread(run_moondream, data_url)
+            
+            logging.debug(f"[WebSearch] Got description: {len(description)} chars")
+            return description.strip()
+            
+        except Exception as e:
+            logging.debug(f"[WebSearch] Moondream2 error: {e}")
+            return ""
+
     @openapi_schema({
         "type": "function",
         "function": {
             "name": "scrape_webpage",
-            "description": "Extract full text content from multiple webpages in a single operation. IMPORTANT: You should ALWAYS collect multiple relevant URLs from web-search results and scrape them all in a single call for efficiency. This tool saves time by processing multiple pages simultaneously rather than one at a time. The extracted text includes the main content of each page without HTML markup by default, but can optionally include full HTML if needed for structure analysis. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `urls` (REQUIRED), `include_html` (optional).",
+            "description": """Fetches content from specified URLs and processes it.
+
+Takes URLs as input, fetches the URL content, converts HTML to markdown, and returns the processed content. Use this tool when you need to retrieve and analyze web content.
+
+Usage notes:
+- IMPORTANT: If an MCP-provided web fetch tool is available, prefer using that tool instead.
+- The URLs must be fully-formed valid URLs.
+- HTTP URLs will be automatically upgraded to HTTPS.
+- Results may be summarized if the content is very large.
+- For GitHub URLs, prefer using the gh CLI via Bash instead (e.g., gh pr view, gh issue view).
+- Batch multiple URLs in a single call for efficiency.
+
+IMPORTANT: You should ALWAYS collect multiple relevant URLs from web-search results and scrape them all in a single call for efficiency.""",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "urls": {
                         "type": "string",
-                        "description": "**REQUIRED** - Multiple URLs to scrape, separated by commas. You should ALWAYS include several URLs when possible for efficiency. Example: 'https://example.com/page1,https://example.com/page2,https://example.com/page3'"
+                        "description": "**REQUIRED** - URLs to scrape, separated by commas. Example: 'https://example.com/page1,https://example.com/page2'"
                     },
                     "include_html": {
                         "type": "boolean",
-                        "description": "**OPTIONAL** - Whether to include the full raw HTML content alongside the extracted text. Set to true when you need to analyze page structure, extract specific HTML elements, or work with complex layouts. Default: false.",
+                        "description": "**OPTIONAL** - Whether to include the full raw HTML content alongside the extracted markdown. Default: false.",
                         "default": False
                     }
                 },
@@ -465,7 +665,7 @@ class SandboxWebSearchTool(SandboxToolsBase):
         try:
             # ---------- Firecrawl scrape endpoint ----------
             logging.info(f"Sending request to Firecrawl for URL: {url}")
-            async with httpx.AsyncClient() as client:
+            async with get_http_client() as client:
                 headers = {
                     "Authorization": f"Bearer {self.firecrawl_api_key}",
                     "Content-Type": "application/json",
